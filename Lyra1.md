@@ -4444,7 +4444,8 @@ Context.AddInstigator(AbilityActorInfo->OwnerActor.Get(), AbilityActorInfo->Avat
 
 `Instigator`: 效果施加者。通常是发起该效果的GameplayAbility的持有者（Owner），例如投掷手雷的玩家角色。这是最终的责任主体，用于计算击杀得分、团队判断等。
 
-`EffectCauser`: 效果的物理引发者。这是造成效果的直接物理实体。例如，如果玩家开枪，Instigator是玩家，EffectCauser可能是子弹的Actor；如果玩家投掷手雷，Instigator是玩家，EffectCauser就是手雷的Actor。两者可以相同。
+`EffectCauser`: 效果的物理引发者。这是造成效果的直接物理实体。例如，如果玩家开枪，Instigator是玩家，EffectCauser可能是子弹的Actor；如果玩家投掷手雷，Instigator是玩家，EffectCauser就是手雷的Actor。<br>
+Instigator和EffectCauser两者可以相同。
 
 `SourceObject`: 效果的来源对象。这是一个更通用的概念，可以是非Actor对象（如数据资产、技能实例等），用于将效果绑定到具体的游戏逻辑对象。
 
