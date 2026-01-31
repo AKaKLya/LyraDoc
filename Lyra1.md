@@ -7121,8 +7121,8 @@ UGameplayAbility::UGameplayAbility
 ![alt text](Lyra1/img2/image-45.png)
 
 <div style="display: flex;">
-  <img src="image-44.png" width="50%" />
-  <img src="image-46.png" width="50%" />
+  <img src="img2/image-44.png" width="50%" />
+  <img src="img2/image-46.png" width="50%" />
 </div>
 
 如果没有用曲线设置Offset，那么摄像机的位置就是玩家所在位置. OffsetCurve真的就只是Offset.
@@ -7615,8 +7615,8 @@ ULyraCameraComponent::GetCameraView
 重写的逻辑在原有的基础上，给`Location`增加一个偏移值.并且做了穿透检测.
 
 <div style="display: flex;">
-  <img src="image-44.png" width="50%" />
-  <img src="image-46.png" width="50%" />
+  <img src="img2/image-44.png" width="50%" />
+  <img src="img2image-46.png" width="50%" />
 </div>
 
 如果没有偏移值，摄像机镜头就位于这个圈里面，是玩家死亡之前的位置.<br>
@@ -8176,7 +8176,7 @@ MeshComponent->SetSkeletalMesh(DesiredMesh, /*bReinitPose=*/ bReinitPose);
 收集完以后，组件根据`Tag` 选择一个骨骼模型. 设置给角色的骨骼网格体.
 
 <div style="display: flex;">
-  <img src="image-59.png" width="75%" />
+  <img src="img2/image-59.png" width="75%" />
 </div>
 
 ---
@@ -8223,7 +8223,7 @@ void ULyraControllerComponent_CharacterParts::OnPossessedPawnChanged(APawn* OldP
 所以 只有使用女角色时，才会去使用`LayerRules`的`Layer`， 使用男角色时 直接`DefaultLayer`.
 
 <div style="display: flex;">
-  <img src="image-60.png" width="75%" />
+  <img src="img2/image-60.png" width="75%" />
 </div>
 
 ---
