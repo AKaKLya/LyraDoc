@@ -395,6 +395,7 @@ class GAMEPLAYMESSAGERUNTIME_API UGameplayMessageSubsystem : public UGameInstanc
 
 `FLyraVerbMessage`:<br>
 `Lyra` 示例项目几乎所有发送的消息都使用单一的 `FLyraVerbMessage` 结构。该消息结构如下所示，包含足够的信息数据字段以涵盖大多数常见的游戏事件。
+
 ![alt text](Lyra1/img2/image-39.png)
 
 结构体：
@@ -601,6 +602,7 @@ class UGameFeatureAction_AddComponents final : public UGameFeatureAction
 `UGameFeatureAction_AddComponents::AddToWorld`
 
 最终在`UGameFrameworkComponentManager::CreateComponentOnInstance`中创建并注册组件.
+
 ![alt text](Lyra1/img/image-13.png)
 
 `Handle`
@@ -911,6 +913,7 @@ void UGameFrameworkComponentManager::CreateComponentOnInstance(AActor* ActorInst
 如果将来在场景中继续生成AModularCharacter，每个AModularCharacter都会在PreInitializeComponents调用到CreateComponentOnInstance函数，为自己创建对应的组件
 
 总结:
+
 ![alt text](Lyra1/img/image-15.png)
 
 #### AddAbility
@@ -1901,6 +1904,7 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 `ChangeBundleStateForPrimaryAssets` 触发状态更改，开始加载资源. 加载完成后 调用`OnExperienceLoadComplete`函数.
 
 更改`CurrentExperience`资产 和 下图中的`ActionSets`资产 的状态为"Equipped".
+
 ![alt text](Lyra1/img/image-21.png)
 
 `OnExperienceLoadComplete` 收集并加载激活`CurrentExperience`涉及到的`GameFeature`
@@ -2297,10 +2301,12 @@ void ALyraPlayerState::PostInitializeComponents()
 
 示例:
 `Plugins/GameFeatures/ShooterCore/Content/Game/HeroData_ShooterGame`
+
 ![alt text](Lyra1/img2/image-6.png)
 
 `AbilitySet_ShooterHero`:<br>
 保存了GA、GE、AttributeSet数据.
+
 ![alt text](Lyra1/img2/image-5.png)
 
 ---
@@ -2859,9 +2865,11 @@ void ULyraHeroComponent::InitializePlayerInput(UInputComponent* PlayerInputCompo
 
 `BindAbilityActions`|`BindNativeAction`接收的第一个参数是`InputConfig`.
 <br>下图中的 `InputConfig = InputData_SimplePawn` 传入这两个函数
+
 ![alt text](Lyra1/img2/image-12.png)
 
 从 `Experience` 到 `InputConfig` 的完整链:
+
 ![alt text](Lyra1/img2/image-11.png)
 
 ---
@@ -4407,6 +4415,7 @@ ALyraCharacter* ULyraGameplayAbility::GetLyraCharacterFromActorInfo() const
 手雷爆炸，造成伤害:
 
 为手雷伤害`GE`创建`EffectContext`，以投掷玩家作为`Instigator`。
+
 ![alt text](Lyra1/img2/image-19.png)
 
 ![alt text](Lyra1/img2/image-20.png)
@@ -7122,6 +7131,7 @@ UGameplayAbility::UGameplayAbility
 ![alt text](Lyra1/img2/image-45.png)
 
 ![alt text](Lyra1/img2/image-44.png)
+
 ![alt text](Lyra1/img2/image-46.png)
 
 
@@ -7615,6 +7625,7 @@ ULyraCameraComponent::GetCameraView
 重写的逻辑在原有的基础上，给`Location`增加一个偏移值.并且做了穿透检测.
 
 ![alt text](Lyra1/img2/image-44.png)
+
 ![alt text](Lyra1/img2/image-46.png)
 
 
@@ -8173,6 +8184,7 @@ MeshComponent->SetSkeletalMesh(DesiredMesh, /*bReinitPose=*/ bReinitPose);
 ```
 
 收集完以后，组件根据`Tag` 选择一个骨骼模型. 设置给角色的骨骼网格体.
+
 ![alt text](Lyra1/img2/image-59.png)
 
 
