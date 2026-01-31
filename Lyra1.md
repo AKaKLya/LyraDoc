@@ -1,5 +1,7 @@
+![Lyra](Lyra1/img/Game.PNG)
 
 # Lyra - 1
+
 
 ---
 
