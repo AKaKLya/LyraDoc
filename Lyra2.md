@@ -272,7 +272,12 @@ ActivatableWidgetT* PushWidgetToLayerStack(FGameplayTag LayerName, UClass* Activ
 ### 添加小控件
 你的这些设计固然很巧妙，但是游戏界面上没有武器UI 看不到子弹数量，右下角空空如也.
 
-和前面的一样，也是`GameFeatureAction` 通过 `GameplayTag` 寻找要添加的位置.<br>
+和前文的不一样，前文的界面是`GameFeatureAction` 通过 `GameplayTag` 寻找要添加的位置.<br>
+这一块是以广播的方式来设置的，学会前文的思路 这一块可以不看.<br>
+
+这一块的设计思路是 当有控件要添加到控件槽时 子系统会广播要往哪个`GameplayTag`的槽位添加控件.<br>
+控件槽就监听这个事件，如果控件槽本身的`GameplayTag` 与 广播的`GameplayTag`一致，那就添加控件.
+
 如下图:
 
 ![alt text](Lyra2/img1/image-9.png)
@@ -677,15 +682,356 @@ void UAsyncAction_ShowConfirmation::HandleConfirmationResult(ECommonMessagingRes
 ---
 
 
-#### 设置面板
+### 设置面板
 
 ![alt text](Lyra2/img1/image-22.png)
 
+---
 
-页面切换，点击上方标题栏中的按钮，切换选项卡.
+#### 选项卡
+
+向选项栏添加按钮 : 
+
+![alt text](Lyra2/img2/image.png)
+
+![alt text](Lyra2/img1/SettingTab.png)
+
+当选项栏中的按钮被点击时，获得按钮的`TabID`更新选项列表.
+
+```cpp
+UUserWidget& OnGenerateEntryWidgetInternal(UObject* Item, TSubclassOf<UUserWidget> DesiredEntryClass, const TSharedRef<STableViewBase>& OwnerTable)
+```
+`UGameSettingListView`重写了列表更新行为，根据传进来的`UObject` 选择对应的UI控件<br>
+函数参数中的`UObject* Item`就是在上图中的代码传进来的:<br>
+```cpp
+ListView_Settings->SetListItems(VisibleSettings);
+```
+`OnGenerateEntryWidgetInternal` :
+
+![alt text](Lyra2/img2/image-1.png)
+
+---
+
+#### 详细列表
+
+提前说明整个设计思路：<br>
+点开设置面板，显示出来的这些选项都是分了组的，<br>
+例如下面的分组有 `Language`、`Replays`.
+
+![alt text](Lyra2/img2/image-17.png)
+
+它虽然需要分组，但是最后在UMG列表里面呈现，<br>
+在列表看来 就是一堆控件而已 ，根本不存在什么分组.<br>
+要显示`Language`这个组名，那就把这个控件传给我好了，<br>
+要显示`Record Replays`选项，那还是把控件传给我.
+
+要描述上图这个界面，可以这样说:<br>
+这个界面里有2组选项，第一组里面只有1个选项，第二组里面有2个选项.<br>
+这2个组 共同构成了整个界面.
+
+那么在代码上 如何设计？<br>
+我可以创建一个类 作为整个界面，这个界面类里面 存了若干个组类，每个组下面 又存了若干个选项类.<br>
+实际上就是在套娃，在设计时 用套娃的代码写法 来描述一个界面.<br>
+就像:
+```cpp
+UMyWidget* CreateScreen()
+{
+	/* 整个界面 */
+	UMyWidget* MyScreen = NewObect<UMyWidget>();
+	
+	/*创建第一组，添加到Screen*/
+	UMyWidget* MyGroup1 = NewObect<UMyWidget>();
+	MyScreen->Add(MyGroup);
+
+	/* 第一组里面的选项 */
+	UMyWidget* MySelect = NewObect<UMyWidget>();
+	MyGroup1->Add(Myselect);
+
+	UMyWidget* MySelect2 = NewObect<UMyWidget>();
+	MyGroup1->Add(Myselect2);
+	
+	/* 第二组 */
+	UMyWidget* MyGroup2 = NewObect<UMyWidget>();
+	MyScreen->Add(MyGroup2);
+
+	return MyScreen;
+}
+```
+
+但是最终在UMG的列表中显示时，就得把整个界面拆开来，因为列表只要控件，它不关心这些设计好的层级.<br>
+所以在最后构造UMG时，需要把界面中的所有选项 都提取出来，这时候就不存在组了，也可以说是 解组.<br>
+
+为了方便在代码里描述界面，我可以通过代码 将这些选项打组，不同类型的选项 在不同的组里面.<br>
+但是在UMG渲染时，要解组.
+
+---
+
+【未来的我 - 在写完这一段设计思路的半个小时之后】 <br>
+既然最后要解组，那为什么前面还要费劲去打组 解组？<br>
+在代码里直接按照渲染顺序从上到下去写不就行了? 到后面还不用解组.<br>
+
+还有，为什么不用蓝图来做，在代码里绕来绕去 套来套去.<br>
+(不理解，但尊重)
+
+---
+
+先说明`分组标题`的构造方法
+
+![alt text](Lyra2/img2/image-2.png)
+
+![alt text](Lyra2/img2/image-4.png)
+
+`OnGenerateEntryWidgetInternal` 根据传来的`UObject* Item`类型，选择对应的UMG控件类，创建控件并添加到列表中.<br>
+最后调用`EntryWidget.SettingItem`. 把`UObject* Item`传到创建的UMG控件.
+
+前文中 `分组标题` 的控件是`W_SettingsListEntry_Header` ，父类是`UGameSettingListEntry_Setting`.
+
+`UGameSettingListEntry_Setting` 重写了`SetSetting`，并且有一个必须绑定的`Text_SettingName`<br>
+`Text_SettingName`在蓝图中绑定文本框，在代码层面就可以操控这个文本框.
+
+![alt text](Lyra2/img2/image-5.png)
+
+![alt text](Lyra2/img2/image-3.png)
+
+使用`UGameSetting`里面的数据 设置`Text_SettingName`.
+
+---
+
+#### 构造过程
+
+问题来了，前文中的 `SetSetting`接收`UGameSetting`，里面存放了分组的名称， 那么这个分组信息是在哪创建的？
+
+要追踪源头，就得去看切换选项卡的时候 发生了什么， 例如 切换到`Game`或者`Video`选项时，列表会显示不同的设置.<br>
+回到梦开始的地方，分析点下`Audio`时 发生的事情，分析如何更新下面的列表数据的来源.
+
+![alt text](Lyra2/img1/SettingTab.png)
+
+这次要看到代码是上图中的一部分:
+
+![alt text](Lyra2/img2/image-7.png)
 
 
+```cpp
+GetRegistry
+⬇
+GetOrCreateRegistry
+```
 
+![alt text](Lyra2/img2/image-8.png)
+
+
+最后创建的 `Registry` 是 `ULyraGameSettingRegistry`类，
+
+创建完以后 传给`Settings_Panel`
+```cpp
+UGameSettingRegistry* UGameSettingScreen::GetOrCreateRegistry()
+{
+	/*...*/
+	Settings_Panel->SetRegistry(NewRegistry);
+	/*...*/
+}
+```
+
+`Settings_Panel`就是那个列表:
+
+![alt text](Lyra2/img2/image-9.png)
+
+---
+```cpp
+UGameSettingRegistry* ULyraSettingScreen::CreateRegistry()
+{
+	ULyraGameSettingRegistry* NewRegistry = NewObject<ULyraGameSettingRegistry>();
+
+	if (ULyraLocalPlayer* LocalPlayer = CastChecked<ULyraLocalPlayer>(GetOwningLocalPlayer()))
+	{
+		NewRegistry->Initialize(LocalPlayer);
+	}
+
+	return NewRegistry;
+}
+```
+前面提到`ULyraGameSettingRegistry`类， 下面分析这个类做了什么事情.<br>
+这个类的构造函数是空的，主要是通过`Initialize`来初始化内容.
+
+
+![alt text](Lyra2/img2/image-10.png)
+
+
+先初始化的是`VideoSettings`，那就通过`VideoSettings`来说明过程吧.
+
+
+![alt text](Lyra2/img2/image-11.png)
+
+
+![alt text](Lyra2/img2/image-12.png)
+
+设置面板的列表 以分组形式呈现.<br>
+`Screen` 下面有 `Display` `Graphics` 这些选项组.<br>
+每一组的下面才是具体的选项.
+
+添加一个新的选项:
+
+![alt text](Lyra2/img2/image-13.png)
+
+---
+
+前文在 `InitializeVideoSettings` 中创建了 `Screen` ，`Screen`下面有 `Display` `Graphics` 这些组<br>
+这个函数最终返回了整个`Screen`.
+```cpp
+UGameSettingCollection* ULyraGameSettingRegistry::InitializeVideoSettings(ULyraLocalPlayer* InLocalPlayer)
+{
+	UGameSettingCollection* Screen = NewObject<UGameSettingCollection>();
+	/* 向Screen添加选项组 */
+	/* 向每个选项组添加具体的设置选项 */
+
+	return Screen;
+}
+```
+
+在创建`Screen`选项后 要把整个`Screen`选项组添加到`RegisteredSettings`中.<br>
+
+```cpp
+void ULyraGameSettingRegistry::OnInitialize(ULocalPlayer* InLocalPlayer)
+{
+	ULyraLocalPlayer* LyraLocalPlayer = Cast<ULyraLocalPlayer>(InLocalPlayer);
+
+	VideoSettings = InitializeVideoSettings(LyraLocalPlayer);
+	RegisterSetting(VideoSettings);
+
+	AudioSettings = /*..*/
+	RegisterSetting(AudioSettings);
+}
+
+void UGameSettingRegistry::RegisterSetting(UGameSetting* InSetting)
+{
+	if (InSetting)
+	{
+		TopLevelSettings.Add(InSetting);
+		InSetting->SetRegistry(this);
+		RegisterInnerSettings(InSetting);
+	}
+}
+
+void UGameSettingRegistry::RegisterInnerSettings(UGameSetting* InSetting)
+{
+	RegisteredSettings.Add(InSetting);
+}
+```
+`RegisteredSettings` 此时保存了 Video 的 `Screen`，Audio 的 `Screen`...
+
+---
+
+如果我点击了`Video`选项卡，列表中应该显示关于`Video`的选项.<br>
+那么它如何找到 `Video` 的 `Screen` ？ (用`Gameplay`选项演示)
+
+![alt text](Lyra2/img2/image-7.png)
+
+
+![alt text](Lyra2/img2/image-15.png)
+
+遍历`RegisteredSettings`，逐个查询名称.
+
+找到之后，添加到过滤中，将过滤器传给设置列表 用来刷新选项.
+```cpp
+void UGameSettingScreen::NavigateToSettings(const TArray<FName>& SettingDevNames)
+{
+	FGameSettingFilterState FilterState;
+
+	for (const FName SettingDevName : SettingDevNames)
+	{
+		if (UGameSetting* Setting = GetRegistry()->FindSettingByDevNameChecked<UGameSetting>(SettingDevName))
+		{
+			FilterState.AddSettingToRootList(Setting);
+		}
+	}
+	
+	Settings_Panel->SetFilterState(FilterState);
+}
+
+
+void UGameSettingPanel::SetFilterState(const FGameSettingFilterState& InFilterState, bool bClearNavigationStack)
+{
+	FilterState = InFilterState;
+
+	if (bClearNavigationStack)
+	{
+		FilterNavigationStack.Reset();
+	}
+
+	RefreshSettingsList();
+}
+```
+
+列表刷新过程:
+```cpp
+void UGameSettingPanel::RefreshSettingsList()
+{
+	VisibleSettings.Reset();
+	Registry->GetSettingsForFilter(FilterState, MutableView(VisibleSettings));
+
+	ListView_Settings->SetListItems(VisibleSettings);
+}`
+```
+关键： `TArray<TObjectPtr<UGameSetting>> VisibleSettings;`
+
+`UGameSettingScreen::NavigateToSettings` 在这个函数中，将整个`Screen`都添加到了`FilterState`中.<br>
+`UGameSettingPanel::SetFilterState` 保存传进来的 `FilterState` .<br>
+`GetSettingsForFilter` 分解`FilterState`保存的整个`Screen`的组，将各个组的内容提取出来，保存在`VisibleSettings`.
+
+`VisibleSettings` 保存的内容 :
+
+![alt text](Lyra2/img2/image-16.png)
+
+最后将整个数组传入`SetListItems`.
+
+关于 `ListView_Settings` :
+```cpp
+UPROPERTY(/*...*/)
+TObjectPtr<UGameSettingListView> ListView_Settings;
+```
+
+`UGameSettingListView` 重写了构造行为， 当接收到`VisibleSettings`的内容后，也就是上图中的`0 1 2 3 4` 这些内容.<br>
+```cpp
+ListView_Settings->SetListItems(VisibleSettings);
+```
+
+`UGameSettingListView::OnGenerateEntryWidgetInternal` 将接收到的`UObject`还原为`UGameSetting`.<br>
+接着 查表，不同的`UGameSetting`设置选项 对应不同的UMG控件类.
+
+查表过程:
+
+![alt text](Lyra2/img2/image-4.png)
+
+不同的设置选项，使用不同的UMG控件:
+
+![alt text](Lyra2/img2/image-16.png)
+
+`OnGenerateEntryWidgetInternal` 在最后阶段将`UGameSetting`传给了创建出来的控件.
+
+```cpp
+UUserWidget& UGameSettingListView::OnGenerateEntryWidgetInternal(UObject* Item, TSubclassOf<UUserWidget> DesiredEntryClass, const TSharedRef<STableViewBase>& OwnerTable)
+{
+	UGameSetting* SettingItem = Cast<UGameSetting>(Item);
+	EntryWidget.SetSetting(SettingItem);
+}
+```
+这里的`EntryWidget`是通过查表创建得来的，`EntryWidget`可以是下图中的任何一个类.
+
+![alt text](Lyra2/img2/image-18.png)
+
+不同的设置都有不同的显示方法，<br>
+而这些类就可以通过重写`SetSetting`函数，以实现根据不同的`UGameSetting`显示不同的UI.
+
+就如上图中的UI界面，`Language`要设置不同的语言，那我就给你绘制一个可以选来选去的控件.<br>
+`Record Replays`是一个开关，那我就给你绘制一个只能在`OFF`和`NO`之间切换到控件.<br>
+
+
+---
+
+
+#### GameSetting
+
+以上只是UI创建显示的过程，还没有分析实际的按钮功能.
 
 
 
