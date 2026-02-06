@@ -6588,12 +6588,166 @@ void FActiveGameplayEffectsContainer::ExecuteActiveEffectsFrom(FGameplayEffectSp
 }
 ```
 
+---
+
+#### GE堆栈
+
+![alt text](Lyra1/img4/image.png)
+
+`StackingType` - 此`GameplayEffect`如何与同一`GameplayEffect`的其他实例叠加<br>
+`StackLimitCount` - `StackingType`对应的堆叠层数上限<br>
+`StackDurationRefreshPolicy` - 堆叠时刷新效果持续时间的策略<br>
+`StackPeriodResetPolicy` - 堆叠时重置效果周期（或不重置）的策略<br>
+`StackExpirationPolicy` - 此`GameplayEffect`持续时间到期时的处理策略<br>
 
 
+---
+
+`StackingType` 
+```cpp
+/** Each caster has its own stack. */
+AggregateBySource,
+
+/** Each target has its own stack. */
+AggregateByTarget,
+```
+
+如果不开启堆栈功能，`StackingType = None` ，一个GE会被多次添加到已应用GE的容器中.<br>
+如果这个GE还使用了`TargetTagsGameplayEffectComponent`为Actor提供Tag，那么这个Tag会被多次添加.<br>
+
+如果开启堆栈功能，`StackingType` = `AggregateBySource` 或者 `AggregateByTarget`.<br>
+一个GE只会在已应用GE的容器中添加一次，为Actor提供的Tag 只会添加一次，不会叠加.
+
+从属性上来说，例如有一个施加持续伤害的GE，每秒造成1点伤害.<br>
+不管开不开启`StackingType` ，在多次应用下 伤害可以叠加.<br>
+
+`StackLimitCount`给了一个可以限制添加次数的选择，<br>
+设置添加一个上限，在多次应用伤害GE的时候 不能太变态，叠到无限层以后还怎么玩.
+
+---
+
+`StackDurationRefreshPolicy` 每次应用GE时，是否要刷新持续时间，<br>
+我向你添加一个灼烧buff，每秒造成1点伤害，持续3秒.<br>
+如果选择`Refresh on Successful Application` ，那么每次添加灼烧buff时 持续时间都会重置为3秒.<br>
+多次添加buff时，不仅伤害在叠加，还要刷新持续时间，这个技能太变态了.<br>
+当你的灼烧终于要结束时，我一个技能过去 灼烧的刷新时间重置了.<br>
+
+如果选择`Never Refresh`，在第二次添加灼烧buff时，只有伤害在叠加，而持续时间不变，还是按照第一个灼烧的时间继续走.<br>
+当灼烧还剩0.5秒就结束时，再添加灼烧buff 不会重置持续时间，在0.5秒后 整个灼烧buff就没了.
+
+---
+
+`StackPeriodResetPolicy`<br>
+灼烧buff，每1秒造成1点伤害，持续3秒.<br>
+第一次添加灼烧 并且经过0.5秒时，我添加了第二个灼烧.<br>
+
+如果选择`Reset on Successful Application`，那么经过的0.5秒会被重置为1.<br>
+从头开始计时，直到再次经过1秒后，才会施加伤害.<br>
+
+举一个极端的例子，每0.2秒施加一个灼烧buff，但是要经过1秒才会造成一次伤害.<br>
+而每次施加都要重新去计时那个1秒，<br>
+好不容易经过了0.2秒，眼看再经过0.8秒就可以造成伤害了，结果又被刷新了 重新从0开始计时.<br>
+每次计时都要被打断，永远不会造成伤害.
+
+如果选择`Never Refresh`，计时不会刷新，就算是在经过了0.9秒时 添加了第二个灼烧，<br>
+在0.1秒之后 依然会造成伤害，并且伤害还要叠加， 因为添加了两个灼烧.
+
+---
+
+`StackExpirationPolicy`
+
+`ClearEntireStack`  当激活的GE过期时，清空整个堆叠. <br>
+
+`RemoveSingleStackAndRefreshDuration` 当前堆叠层数减1并刷新持续时间.<br>
+GE不会"重新施加"，仅以减少一层堆叠的状态继续存在。<br>
+
+`RefreshDuration` 刷新GE的持续时间.<br>
+这实际上会使GE变为无限持续时间，可通过`OnStackCountChange`回调手动处理堆叠层数的减少 .
+
+---
+
+`Overflow`
+
+`OverflowEffects` 当堆叠的GE因尝试再次应用而"溢出"（超过堆叠层数上限）时需要施加的GE。<br>
+无论溢出应用是否成功，这些GE都会被添加。
+
+`bDenyOverflowApplication` 如果为true，当已处于堆叠层数上限时，后续的堆叠尝试将会失败，且不会刷新持续时间和上下文.
+
+`bClearStackOnOverflow` 如果为true，GE溢出时将清除其整个堆叠.
+
+---
+
+Stack 的配置就是这样子，要获取某个GE叠了多少层 可以用这个函数:
+
+![alt text](Lyra1/img4/GetGEStackCount.png)
+
+---
+
+代码时间 : 
+
+```cpp
+UAbilitySystemComponent::ApplyGameplayEffectSpecToSelf
+FActiveGameplayEffectsContainer::ApplyGameplayEffectSpec
+FActiveGameplayEffectsContainer::FindStackableActiveGameplayEffect
+```
+
+只要不是`Instant`模式，就可以使用堆栈功能 : 
+```cpp
+UAbilitySystemComponent::ApplyGameplayEffectSpecToSelf()
+{
+    if (Spec.Def->DurationPolicy != EGameplayEffectDurationType::Instant 
+    || bTreatAsInfiniteDuration)
+	{
+		AppliedEffect = ActiveGameplayEffects.ApplyGameplayEffectSpec(Spec, PredictionKey, bFoundExistingStackableGE);
+		if (!AppliedEffect)
+		{
+			return FActiveGameplayEffectHandle();
+		}
+     }
+}
+```
+
+在已经应用的GE中 寻找可叠加的GE :
+```cpp
+FActiveGameplayEffectsContainer::ApplyGameplayEffectSpec()
+{
+    FActiveGameplayEffect* ExistingStackableGE = FindStackableActiveGameplayEffect(Spec);
+}
+```
+
+`FindStackableActiveGameplayEffect` 在已应用的GE中，寻找即将应用的GE，如果找到 就返回存在的GE.<br>
+就是说看看这个GE在此前有没有应用过.
+
+
+```cpp
+FActiveGameplayEffectsContainer::ApplyGameplayEffectSpec()
+{
+    FActiveGameplayEffect* ExistingStackableGE = FindStackableActiveGameplayEffect(Spec);
+    // Check if there's an active GE this application should stack upon
+	if (ExistingStackableGE)
+    {
+        /*...*/
+        if (ExistingSpec.GetStackCount() == ExistingSpec.Def->StackLimitCount)
+		{
+			if (!HandleActiveGameplayEffectStackOverflow(*ExistingStackableGE, ExistingSpec, Spec))
+			{
+				return nullptr;
+			}
+		}
+        /*...*/
+    }
+}
+```
+`ExistingStackableGE` `ExistingSpec` 已经存在的GE和对应的GESpec.<br>
+`Spec` 即将应用的GE.
+
+TODO:不想写了，先放着吧.
 
 
 ---
 ### LyraGAS
+
+[抢先预告](https://dev.epicgames.com/documentation/zh-cn/unreal-engine/abilities-in-lyra-in-unreal-engine)
 
 ---
 
