@@ -3139,7 +3139,23 @@ namespace LyraGameplayTags
 `AbilitySystemComponent` <br>
 核心组件，技能都通过这个组件进行交互.<br>
 
+---
 
+来自未来的我:<br>
+我觉得要补充的是 如何使用这个框架去设计技能.<br>
+有些教程并没有一个很好的设计方法，有些功能散落在各个地方，而且某些类 管的有点宽了.<br>
+
+在`Lyra`中，<br>
+`AttributeSet`只保存生命值 这种角色属性，当属性变化时 `AttributeSet`会将属性变化广播出去，<br>
+至于角色如何响应属性变化， 例如 生命值为0 要死亡了，`AttributeSet`并不关心.<br>
+而是外部来订阅`AttributeSet`的广播事件 做出各自的响应.
+
+只有`AbilitySystemComponent`持有`AttributeSet`，要对角色属性做出任何修改 都要通过`GameplayEffect`来做.<br>
+
+
+
+
+---
 
 [GAS - 中文](https://github.com/BillEliot/GASDocumentation_Chinese)
 
@@ -4257,7 +4273,7 @@ FActiveGameplayEffectHandle UAbilitySystemComponent::ApplyGameplayEffectSpecToSe
 
 ---
 
-##### GA
+##### GA的部分接口
 
 ```cpp
 /**
@@ -4611,6 +4627,118 @@ FGameplayAbilityActorInfo UGameplayAbility::GetActorInfo() const
 
 ---
 
+##### 实例化
+
+在角色类中使用一个TArray存放初始赋予的技能，
+```cpp
+UPROPERTY(EditAnywhere,Category="Ability")
+TArray<TSubclassOf<UGameplayAbility>> StartUpAbility;
+
+ACryCharacter::BeginPlay()
+{
+    for (const auto Ability : StartUpAbility)
+    {
+	    ASC->GiveAbility(Ability);
+    }
+}
+
+// UAbilitySystemComponent::GiveAbility(const FGameplayAbilitySpec& Spec)
+```
+`GiveAbility`接收的参数类型是`FGameplayAbilitySpec`.<br>
+`ASC->GiveAbility(Ability);`使用`Ability`作为参数 构造了一个`Spec`.
+
+触发这个版本的构造函数:
+```cpp
+/** Ability of the spec (Always the CDO. This should be const but too many things modify it currently) */
+UPROPERTY()
+TObjectPtr<UGameplayAbility> Ability;
+
+FGameplayAbilitySpec::FGameplayAbilitySpec(TSubclassOf<UGameplayAbility> InAbilityClass, int32 InLevel, int32 InInputID, UObject* InSourceObject)
+	: Ability(InAbilityClass ? InAbilityClass.GetDefaultObject() : nullptr)
+```
+`Spec` 把传进来的`AbilityClass`的CDO对象保存到成员变量`Ability`中.
+
+```
+每个 UCLASS 都保留一个称作 类默认对象（Class Default Object） 的对象，简称CDO。CDO 本质上是一个默认"模板"对象，由类构建函数生成，之后就不再修改。
+```
+简单来说 `CDO`就是蓝图中编辑的那个东西，`SpawnActor`就是将`CDO`实例化.<br>
+或者说是 根据`CDO`创建一个`Actor`.
+
+在Lyra中，将CDO里面设置的`InputTag`保存到`Spec`的`DynamicAbilityTags`.<br>
+```cpp
+ULyraGameplayAbility* AbilityCDO = AbilityToGrant.Ability->GetDefaultObject<ULyraGameplayAbility>();
+
+FGameplayAbilitySpec AbilitySpec(AbilityCDO, AbilityToGrant.AbilityLevel);
+AbilitySpec.SourceObject = SourceObject;
+AbilitySpec.DynamicAbilityTags.AddTag(AbilityToGrant.InputTag);
+
+const FGameplayAbilitySpecHandle AbilitySpecHandle = LyraASC->GiveAbility(AbilitySpec);
+```
+
+---
+
+由于`Spec`的`Ability`变量是技能的`CDO`对象，在实例化到场景中、或者赋予到角色身上后，<br>
+如果调用方式不正确，那么对`Ability`的一些操作可能和预期的不一致.
+
+假设继承了`GameplayAbility`类，并且添加了一个新的函数，如果没有区分`CDO`和`Instance`，在函数调用过程中 可能调用的是`CDO`上的函数，而角色身上的是`Instance`，<br>
+`Instance`不会响应函数调用，响应调用的却是`CDO`.
+
+尤其是在需要`GetWorld`的情况下，`Instance`可以获取`World`，而`CDO`是没有`World`的，<br>
+最终`GetWorld`返回空指针 导致游戏崩溃.
+
+```cpp
+UWorld* UGameplayAbility::GetWorld() const
+{
+	if (!IsInstantiated())
+	{
+		// If we are a CDO, we must return nullptr instead of calling Outer->GetWorld() to fool UObject::ImplementsGetWorld.
+		return nullptr;
+	}
+	return GetOuter()->GetWorld();
+}
+```
+
+关于赋予技能时的实例化部分: 
+```cpp
+UAbilitySystemComponent::GiveAbility(const FGameplayAbilitySpec& Spec)
+{
+    FGameplayAbilitySpec& OwnedSpec = ActivatableAbilities.Items[ActivatableAbilities.Items.Add(Spec)];
+	
+	if (OwnedSpec.Ability->GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::InstancedPerActor)
+	{
+		// Create the instance at creation time
+		CreateNewInstanceOfAbility(OwnedSpec, Spec.Ability);
+	}
+	
+	OnGiveAbility(OwnedSpec);
+	MarkAbilitySpecDirty(OwnedSpec, true);
+
+	return OwnedSpec.Handle;
+}
+```
+
+---
+
+那搞了半天 在激活技能时要区分`CDO`和`Instance`，为什么在蓝图中激活技能时要注意什么?<br>
+“什么也不需要注意”.
+
+在蓝图中调用`TryActivateAbility`时，要传入一个`SpecHandle`，ASC根据`Handle`去找到并激活对应的`Spec`中的`Ability`.
+
+`TryActivateAbilityByClass` 内部会获取传入的Class的`CDO`,<br>
+遍历所有的`Spec`，直到找到一个`Spec` 它的`Ability`和传入的`CDO`一致，然后激活这个技能.
+
+`TryActivateAbilitiesByTag` 根据`Tag`触发技能，实际上也是从`Spec`保存的`Ability`中寻找带有这个`Tag`的技能.<br>
+
+部分代码 :  `AbilityTags`在下文的`Tag`这一节介绍.
+```cpp
+for (const FGameplayAbilitySpec& Spec : ActivatableAbilities.Items)
+{		
+	if (Spec.Ability && Spec.Ability->AbilityTags.HasAll(GameplayTagContainer))
+}
+```
+
+---
+
 ##### 技能激活
 
 检查消耗和CD， 失败则结束技能.
@@ -4863,7 +4991,8 @@ UPROPERTY(/**/)
 FGameplayTagContainer AbilityTags;
 ```
 
-ASC利用`AbilityTags`查找技能：<br>
+用到了`AbilityTags`的相关函数 `TryActivateAbilitiesByTag`. <br>
+ASC利用`AbilityTags`查找技能，从而实现根据`Tag`激活技能:<br>
 `GetActivatableGameplayAbilitySpecsByAllMatchingTags`<br>
 `FindAllAbilitiesWithTags`<br>
 在 `ActivatableAbilities` 容器中，查找拥有此标签的 `AbilitySpec`.
@@ -4902,7 +5031,9 @@ const FGameplayTagContainer& CancelTags)
 ---
 
 ###### BlockAbilitiesWithTag
-该技能激活前，阻挡拥有此标签的技能
+该技能激活前，阻挡拥有此标签的技能，但是忽略本技能.<br>
+
+例如，触发了技能A，A配置了这个标签，ASC会去查询并阻止拥有这个标签的技能，而技能A不受影响 依然会执行.
 ```cpp
 /** Abilities with these tags are blocked while this ability is active */
 UPROPERTY(/**/)
@@ -4911,17 +5042,57 @@ FGameplayTagContainer BlockAbilitiesWithTag;
 在技能激活前，`PreActivate` 根据这个标签 阻挡其他技能.
 
 ```cpp
-void UAbilitySystemComponent::ApplyAbilityBlockAndCancelTags(/* */ 
-const FGameplayTagContainer& CancelTags)
+UGameplayAbility::PreActivate()
 {
-    if (bEnableBlockTags)
-    {
-        BlockAbilitiesWithTags(BlockTags);
-    }
+    Comp->ApplyAbilityBlockAndCancelTags(AbilityTags, this, true, BlockAbilitiesWithTag, true, CancelAbilitiesWithTag);
+}
+
+void UAbilitySystemComponent::ApplyAbilityBlockAndCancelTags(const FGameplayTagContainer& AbilityTags, UGameplayAbility* RequestingAbility, bool bEnableBlockTags, const FGameplayTagContainer& BlockTags, bool bExecuteCancelTags, const FGameplayTagContainer& CancelTags)
+{
+    BlockAbilitiesWithTags(BlockTags);
+    CancelAbilities(&CancelTags, nullptr, RequestingAbility);
 }
 ```
 
-ASC函数 `BlockAbilitiesWithTags` 将参数中的Tag收集起来. 存到`BlockedAbilityTags`
+因为在调用`ApplyAbilityBlockAndCancelTags`时，参数都是`true`，所以精简之后就剩两行了.<br>
+
+`BlockAbilitiesWithTags` 将参数中的Tag收集起来. 存到`BlockedAbilityTags`.
+
+```cpp
+/** Cancel all abilities with the specified tags. Will not cancel the Ignore instance */
+void CancelAbilities(const FGameplayTagContainer* WithTags=nullptr, const FGameplayTagContainer* WithoutTags=nullptr, UGameplayAbility* Ignore=nullptr)
+{
+    for (FGameplayAbilitySpec& Spec : ActivatableAbilities.Items)
+    {
+        CancelAbilitySpec(Spec, Ignore);
+    }
+}
+ ```
+
+`CancelAbilities` 根据`CancelTags`去取消技能，<br>
+因为`RequestingAbility`作为了`Ignore`参数，实际上也就是下面这一行传进去的`this`:
+```cpp
+UGameplayAbility::PreActivate()
+{
+    Comp->ApplyAbilityBlockAndCancelTags(AbilityTags, this,/*...*/);
+}
+```
+最终在这里取消技能: 只要不是`Ignore`的技能 都要被取消.
+```cpp
+UAbilitySystemComponent::ApplyAbilityBlockAndCancelTags
+void UAbilitySystemComponent::CancelAbilitySpec(FGameplayAbilitySpec& Spec, UGameplayAbility* Ignore)
+{
+    // We need to cancel spawned instance, not the CDO
+    TArray<UGameplayAbility*> AbilitiesToCancel = Spec.GetAbilityInstances();
+	for (UGameplayAbility* InstanceAbility : AbilitiesToCancel)
+    {
+        if (InstanceAbility && Ignore != InstanceAbility)
+	    {
+		    InstanceAbility->CancelAbility(Spec.Handle, ActorInfo, InstanceAbility->GetCurrentActivationInfo(), true);
+	    }
+    }
+}
+```
 
 下一个技能激活时，`UGameplayAbility::CanActivateAbility` 就会查询ASC的`BlockedAbilityTags`.
 
@@ -5765,6 +5936,41 @@ bool UGameplayAbility::CheckCooldown(const FGameplayAbilitySpecHandle Handle, co
 配置GE的持续时长，这个时长就是冷却时长.<br>
 向GE添加表示技能冷却的标签， 最后将这个GE配置给GA的`冷却GE`.
 
+----
+
+##### GameplayEffectUIData
+
+`UGameplayEffectUIData`<br>
+用于提供关于如何在UI中描述Gameplay效果的游戏特定数据的基类。<br>
+创建包含你游戏所需数据的子类来使用。
+在 Unreal Engine 5.3 中，此类现在派生自 UGameplayEffectComponent，因此你可以直接将其用作 GameplayEffectComponent。
+
+`UGameplayEffectUIData_TextOnly` <br>
+仅包含文本的UI数据。这主要用作 UGameplayEffectUIData 子类的示例。<br>
+如果你的游戏仅需要文本，这是一个可以使用的合理类。若要包含更多数据，请创建 UGameplayEffectUIData 的自定义子类。
+
+`TextOnly`类只有一个蓝图可编辑的变量 `FText Description;`
+
+`UIData`组件只有一个用法:在蓝图中获取`UIData`，获取之后干什么 就是自己的事情了.
+```cpp
+const UGameplayEffectUIData* UAbilitySystemBlueprintLibrary::GetGameplayEffectUIData(TSubclassOf<UGameplayEffect> EffectClass, TSubclassOf<UGameplayEffectUIData> DataType)
+{
+	if (const UGameplayEffect* Effect = EffectClass.GetDefaultObject())
+	{
+		const UGameplayEffectUIData* UIData = Effect->FindComponent<UGameplayEffectUIData>();
+    }
+}
+```
+
+`UIData`类还有一个前世故事:
+```cpp
+/** 此效果在UI中显示所需的数据。应包含文本、图标等内容。在仅服务器构建中不可用。 */
+UE_DEPRECATED(5.3, "UI Data 属性已废弃。UGameplayEffectUIData 现已派生自 UGameplayEffectComponent，请将其作为 GameplayEffectComponent 添加。之后可通过 FindComponent<UGameplayEffectUIData>() 访问.")
+UPROPERTY(BlueprintReadOnly, Transient, Instanced, Category = "Deprecated|Display", meta = (DeprecatedProperty))
+TObjectPtr<class UGameplayEffectUIData> UIData;
+```
+
+通过这些注释可以了解这个类的作用，原本是描述GE在UI中要显示的内容.
 
 
 ---
@@ -6043,6 +6249,104 @@ GE应用时 一路过来 `EventType`都是 `OnActive` 或者 `WhileActive`,<br>
 蓝图中重写的函数：
 
 ![alt text](Lyra1/img2/image-36.png)
+
+---
+
+#### GameplayCue 2
+
+这部分是未来的我写的内容，主打一个简洁.<br>
+前面写的那一节 我自己都不想看.
+
+![alt text](Lyra1/img4/GC2.png)
+
+---
+
+`AGameplayCueNotify_Actor` 向蓝图公开了几个函数:<br>
+`UGameplayCueNotify_Static` 的函数也是一样的.
+```cpp
+/** 通用事件图表事件，将对所有事件类型调用 */
+UFUNCTION(BlueprintImplementableEvent, Category = "GameplayCueNotify", DisplayName = "HandleGameplayCue", meta=(ScriptName = "HandleGameplayCue"))
+void K2_HandleGameplayCue(AActor* MyTarget, EGameplayCueEvent::Type EventType, const FGameplayCueParameters& Parameters);
+
+/** 当GameplayCue执行时调用，用于瞬发效果或周期性触发 */
+UFUNCTION(BlueprintNativeEvent, Category = "GameplayCueNotify")
+bool OnExecute(AActor* MyTarget, const FGameplayCueParameters& Parameters);
+
+/** 当持续型GameplayCue首次激活时调用（仅在客户端见证激活时触发） */
+UFUNCTION(BlueprintNativeEvent, Category = "GameplayCueNotify")
+bool OnActive(AActor* MyTarget, const FGameplayCueParameters& Parameters);
+
+/** 当持续型GameplayCue首次显示为激活状态时调用 */
+UFUNCTION(BlueprintNativeEvent, Category = "GameplayCueNotify")
+bool WhileActive(AActor* MyTarget, const FGameplayCueParameters& Parameters);
+
+/** 当持续型GameplayCue被移除时调用 */
+UFUNCTION(BlueprintNativeEvent, Category = "GameplayCueNotify")
+bool OnRemove(AActor* MyTarget, const FGameplayCueParameters& Parameters);
+```
+
+以上这些函数都在`AGameplayCueNotify_Actor::HandleGameplayCue`里面调用.<br>
+所以 `HandleGameplayCue` 就是这个`Actor`公开给`GameplayCue`的入口.
+
+`HandleGameplayCue`在调用这些函数时，用了`switch (EventType)`，`EventType`是哪里来的?
+
+```cpp
+UAbilitySystemComponent::ApplyGameplayEffectSpecToSelf()
+{
+    //立即缓存该值，以防后续可能将预测性即时效果修改为无限持续时间效果。
+    bool bInvokeGameplayCueApplied = Spec.Def->DurationPolicy != EGameplayEffectDurationType::Instant; 
+    if(bInvokeGameplayCueApplied)
+    {
+        InvokeGameplayCueEvent(*OurCopyOfSpec, EGameplayCueEvent::OnActive);
+		InvokeGameplayCueEvent(*OurCopyOfSpec, EGameplayCueEvent::WhileActive);
+    }
+}
+```
+
+只要这个GE不是立即触发的，`EventType`就是`OnActive`、`WhileActive`.
+
+---
+`UGameplayCueNotify_Burst`<br>
+`AGameplayCueNotify_BurstLatent`<br>
+
+Burst版本 新增了一个`OnBurst`函数:<br>
+```cpp
+UFUNCTION(BlueprintImplementableEvent)
+void OnBurst(AActor* Target, const FGameplayCueParameters& Parameters, const FGameplayCueNotify_SpawnResult& SpawnResults) const;
+
+AGameplayCueNotify_BurstLatent::OnExecute_Implementation()
+{
+    OnBurst(Target, Parameters, BurstSpawnResults);
+}
+```
+`OnBurst`在`OnExecute`中调用，而`OnExecute`用于瞬发效果或周期性触发.<br>
+所以 `Burst`版本的GC就是用于瞬发或周期GE的，
+
+```cpp
+AGameplayCueNotify_BurstLatent::OnExecute_Implementation()
+{
+    BurstEffects.ExecuteEffects(SpawnContext, BurstSpawnResults);
+    OnBurst(Target, Parameters, BurstSpawnResults);
+
+    // 默认处理GameplayCue移除。这是为处理当前能想到的所有情况而设置的简单默认处理。
+    // 若不这样做，我们将依赖每个BurstLatent型GameplayCue在蓝图图表中手动设置移除逻辑，
+    // 或依赖基于参数的推断逻辑。
+    if (World)
+    {
+        const float Lifetime = FMath::Max<float>(AutoDestroyDelay, DefaultBurstLatentLifetime);
+        World->GetTimerManager().SetTimer(FinishTimerHandle, this, &AGameplayCueNotify_Actor::GameplayCueFinishedCallback, Lifetime);
+    }
+}
+```
+其中`const float DefaultBurstLatentLifetime = 5.0f;`.<br>
+蓝图中可以设置`AutoDestroyDelay`参数.
+
+上面的代码段中 还有一个 BurstGC 特供的`BurstEffect`:<br>
+`BurstEffects.ExecuteEffects` 
+
+![alt text](Lyra1/img4/BurstGC_Effect.png)
+
+
 
 
 
@@ -6957,7 +7261,8 @@ ULyraAbilitySystemComponent::ProcessAbilityInput
 ---
 
 伤害计算 <br>
-不想写了，这些函数的具体意义参见上一章 `GAS源码分析 - AttributeSet`.
+不想写了，这些函数的具体意义参见上一章 `GAS源码分析 - AttributeSet`.<br>
+代码部分也简单，很多地方都有注释，看他们留下的注释就好了.
 
 ---
 `BaseDamage` `BaseHeal`的用法是一样的，所以只需要说明`BaseDamage`就行了.<br>
