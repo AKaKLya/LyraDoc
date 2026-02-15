@@ -4395,7 +4395,7 @@ FGameplayAbilitySpecContainer ActivatableAbilities;
 
 ---
 
-##### EffectContext
+##### GameplayEffectContext
 `Instigator` 是一个非常关键和常见的概念。
 它的核心含义是 “引发事件的责任方” 或 “行为的发起者”。
 
@@ -8486,6 +8486,89 @@ for (FPhaseObserver& Observer : PhaseStartObservers)
    - 通知观察者WarmUp结束
    - ActivePhaseMap = { Game.Playing }
 ```
+
+---
+
+#### 自定义技能消耗
+
+回顾一下检查技能消耗的流程:
+
+![alt text](Lyra1/img2/image-22.png)
+
+```cpp
+bool UGameplayAbility::K2_CheckAbilityCost()
+{
+	check(CurrentActorInfo);
+	return CheckCost(CurrentSpecHandle, CurrentActorInfo);
+}
+
+bool UGameplayAbility::CheckCost(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, OUT FGameplayTagContainer* OptionalRelevantTags) const
+{
+	UGameplayEffect* CostGE = GetCostGameplayEffect();
+	if (CostGE)
+	{
+        /*...*/
+		if (!AbilitySystemComponent->CanApplyAttributeModifiers(CostGE, GetAbilityLevel(Handle, ActorInfo), MakeEffectContext(Handle, ActorInfo)))
+		{
+            /*...*/
+			return false;
+		}
+	}
+	return true;
+}
+```
+
+最后来到了:
+```cpp
+bool CanApplyAttributeModifiers(const UGameplayEffect *GameplayEffect, float Level, const FGameplayEffectContextHandle& EffectContext)
+{
+	return ActiveGameplayEffects.CanApplyAttributeModifiers(GameplayEffect, Level, EffectContext);
+}
+```
+`CanApplyAttributeModifiers` : 测试`GE`中的所有修改器是否会使属性值保持大于 0.f<br>
+换一个说法，检查一个即将应用的`GE`是否会使得任何受影响的属性值降至负数，<br>
+如果这个`GE`会让法力值变为负数，就说明当前的法力值不足以施放这个技能.
+
+精简后的核心部分: 从`AttributeSet`中拿到要消耗的属性值，然后检查`当前值+消耗值`是否小于0.
+```cpp
+FActiveGameplayEffectsContainer::CanApplyAttributeModifiers()
+{
+    const UAttributeSet* Set = Owner->GetAttributeSubobject(ModDef.Attribute.GetAttributeSetClass());
+	float CurrentValue = ModDef.Attribute.GetNumericValueChecked(Set);
+	float CostValue = ModSpec.GetEvaluatedMagnitude();
+
+    if (CurrentValue + CostValue < 0.f)
+	{
+		return false;
+	}
+
+    return true;
+}
+```
+
+所以 在法力值不足的情况下，`CheckCost`返回`false`，不可以激活技能.
+
+`CheckCost` 是一个虚函数，`LyraGameplayAbility`重写了这个函数 做了一些自定义的消耗计算.
+
+`ApplyCost` 也是虚函数，在`LyraGameplayAbility`里重写了这个函数.
+
+---
+
+应用消耗，如果可以施放技能，就把法力值减下去.
+
+`ApplyCost` 就是把配置消耗的那个`GE`应用到ASC上，也就是从`AttributeSet`中减去法力值.
+
+```cpp
+void UGameplayAbility::ApplyCost()
+{
+	UGameplayEffect* CostGE = GetCostGameplayEffect();
+	if (CostGE)
+	{
+		ApplyGameplayEffectToOwner(Handle, ActorInfo, ActivationInfo, CostGE, GetAbilityLevel(Handle, ActorInfo));
+	}
+}
+```
+
 
 
 ---
