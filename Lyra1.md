@@ -3136,22 +3136,33 @@ namespace LyraGameplayTags
 `GameplayAbility` <br>
 可自定义逻辑的角色技能，支持冷却、法力消耗功能.
 
-`AbilitySystemComponent` <br>
+`AbilitySystemComponent` -(简称 `ASC`) <br>
 核心组件，技能都通过这个组件进行交互.<br>
 
 ---
 
 来自未来的我:<br>
-我觉得要补充的是 如何使用这个框架去设计技能.<br>
-有些教程并没有一个很好的设计方法，有些功能散落在各个地方，而且某些类 管的有点宽了.<br>
+我觉得要补充的是 如何使用这个框架去设计技能系统.<br>
+有些教程并没有一个很好的设计方法，功能散落在各个地方，而且某些类 管的有点宽了.<br>
 
+整体架构:<br>
+`Character`拥有`ASC`、`AttributeSet`.<br>
+必须通过对`ASC`应用一个`GE`才能修改`AttributeSet`中的属性数值.
+
+`Ability`用来写技能逻辑，当技能要对敌人造成伤害时，也是通过应用`GE`来修改敌人的生命值.
+
+`ASC`拥有一些可绑定的委托，天然的观察者设计模式，<br>
+这些委托可以让多个模块的功能联动起来，<br>
+例如:触发技能，播放攻击动画,<br>
+在攻击动画播放到某一帧时 向 `ASC` 发送一个`GameplayEvent`消息，<br>
+(`EventTag`当然是技能和动画之间约定好的) <br>
+订阅了这个消息的`Ability`收到这个`GameplayEvent`的话 就知道碰撞检测的时机到了.<br>
+
+同样的道理，某些耦合也可以用这个方法来解.<br>
 在`Lyra`中，<br>
 `AttributeSet`只保存生命值 这种角色属性，当属性变化时 `AttributeSet`会将属性变化广播出去，<br>
 至于角色如何响应属性变化， 例如 生命值为0 要死亡了，`AttributeSet`并不关心.<br>
 而是外部来订阅`AttributeSet`的广播事件 做出各自的响应.
-
-只有`AbilitySystemComponent`持有`AttributeSet`，要对角色属性做出任何修改 都要通过`GameplayEffect`来做.<br>
-
 
 
 
@@ -3159,7 +3170,6 @@ namespace LyraGameplayTags
 
 [GAS - 中文](https://github.com/BillEliot/GASDocumentation_Chinese)
 
-[AbilitySystemComponent.h 提供的功能](ASC.md)
 ```cpp
 /** 
  *	UAbilitySystemComponent	
@@ -3185,6 +3195,7 @@ namespace LyraGameplayTags
  */
 ```
 
+---
 
 #### GaemplayEffect
 [GE-中文](cn/GameplayEffect.h)
@@ -3277,8 +3288,8 @@ TObjectPtr<UStruct> AttributeOwner;  // 属性所属的结构（通常是UAttrib
 - 数据驱动：支持外部数据源配置属性
 
 ---
+##### 数值钳制
 
-属性Clamp :
 ```cpp
 /* 执行(execute) ---> 即时修改属性基础值的操作 */
 /**
@@ -3527,9 +3538,195 @@ PostGameplayEffectExecute 已经钳制了属性.<br>
 
 ---
 
+##### 数值过程
+
+```cpp
+UAbilitySystemComponent::ApplyGameplayEffectSpecToSelf
+UAbilitySystemComponent::ExecuteGameplayEffect
+FActiveGameplayEffectsContainer::ExecuteActiveEffectsFrom
+FActiveGameplayEffectsContainer::InternalExecuteMod
+```
+
+---
+
+![alt text](Lyra1/img4/image-15.png)
+
+
+`PreGameplayEffectExecute` 可以返回 `false` 以“丢弃”本次修改。
+
+```cpp
+if (AttributeSet->PreGameplayEffectExecute(ExecuteData))
+{
+    ApplyModToAttribute(ModEvalData.Attribute, ModEvalData.ModifierOp, ModEvalData.Magnitude, &ExecuteData);
+}
+```
+
+`ApplyModToAttribute` 获取`Attribute`的当前值，计算新值，并把新值设置过去.
+```cpp
+void FActiveGameplayEffectsContainer::ApplyModToAttribute(const FGameplayAttribute &Attribute, TEnumAsByte<EGameplayModOp::Type> ModifierOp, float ModifierMagnitude, const FGameplayEffectModCallbackData* ModData)
+{
+	CurrentModcallbackData = ModData;
+	float CurrentBase = GetAttributeBaseValue(Attribute);
+	float NewBase = FAggregator::StaticExecModOnBaseValue(CurrentBase, ModifierOp, ModifierMagnitude);
+
+	SetAttributeBaseValue(Attribute, NewBase);
+}
+
+void FActiveGameplayEffectsContainer::SetAttributeBaseValue(FGameplayAttribute Attribute, float NewBaseValue)
+{
+    const UAttributeSet* Set = Owner->GetAttributeSubobject(Attribute.GetAttributeSetClass());
+    Set->PreAttributeBaseChange(Attribute, NewBaseValue);
+
+    FGameplayAttributeData* DataPtr = /*...*/
+    DataPtr->SetBaseValue(NewBaseValue);
+
+    InternalUpdateNumericalAttribute(Attribute, NewBaseValue, nullptr);
+    Set->PostAttributeBaseChange(Attribute, OldBaseValue, NewBaseValue);
+}
+```
+(后文还要回到这个 `SetAttributeBaseValue` 函数)
+
+`Set->PreAttributeBaseChange`  这里又转到了`AttributeSet`.<br>
+`AttributeSet` 目前的过程:
+```cpp
+PreGameplayEffectExecute
+
+/* ApplyModToAttribute */
+PreAttributeBaseChange
+```
+
+`InternalUpdateNumericalAttribute`
+```cpp
+void FActiveGameplayEffectsContainer::InternalUpdateNumericalAttribute(FGameplayAttribute Attribute, float NewValue, const FGameplayEffectModCallbackData* ModData, bool bFromRecursiveCall)
+{
+	const float OldValue = Owner->GetNumericAttribute(Attribute);
+
+	Owner->SetNumericAttribute_Internal(Attribute, NewValue);
+}
+
+void UAbilitySystemComponent::SetNumericAttribute_Internal(const FGameplayAttribute &Attribute, float& NewFloatValue)
+{
+	
+	const UAttributeSet* AttributeSet = /**/;
+	Attribute.SetNumericValueChecked(NewFloatValue, const_cast<UAttributeSet*>(AttributeSet));
+}
+
+void FGameplayAttribute::SetNumericValueChecked(float& NewValue, class UAttributeSet* Dest) const
+{
+    FGameplayAttributeData* DataPtr = StructProperty->ContainerPtrToValuePtr<FGameplayAttributeData>(Dest);
+		
+	OldValue = DataPtr->GetCurrentValue();
+	Dest->PreAttributeChange(*this, NewValue);
+	DataPtr->SetCurrentValue(NewValue);
+	Dest->PostAttributeChange(*this, OldValue, NewValue);
+}
+```
+`AttributeSet` 目前的过程:都来自`ApplyModToAttribute`.
+```cpp
+PreGameplayEffectExecute
+
+/* ApplyModToAttribute */
+PreAttributeBaseChange
+
+PreAttributeChange
+PostAttributeChange
+PostAttributeBaseChange
+```
+
+回到前面的`InternalExecuteMod`函数:
+```cpp
+bool FActiveGameplayEffectsContainer::InternalExecuteMod(FGameplayEffectSpec& Spec, FGameplayModifierEvaluatedData& ModEvalData)
+{
+    if (AttributeSet->PreGameplayEffectExecute(ExecuteData))
+    {
+        ApplyModToAttribute(ModEvalData.Attribute, ModEvalData.ModifierOp, ModEvalData.Magnitude, &ExecuteData);
+
+        AttributeSet->PostGameplayEffectExecute(ExecuteData);
+    }
+}
+```
+
+`AttributeSet` 目前的过程:
+```cpp
+/* InternalExecuteMod */
+PreGameplayEffectExecute
+
+/* ApplyModToAttribute */
+PreAttributeBaseChange
+
+PreAttributeChange
+PostAttributeChange
+PostAttributeBaseChange
+
+/* InternalExecuteMod */
+PostGameplayEffectExecute
+```
+
+---
+
+在Lyra中，伤害应用过程都在 `PostGameplayEffectExecute` 函数中，在这里`SetHealth`<br>
+`SetHealth`在修改数值，
+
+```cpp
+ULyraHealthSet::SetHealth
+UAbilitySystemComponent::SetNumericAttributeBase
+FActiveGameplayEffectsContainer::SetAttributeBaseValue
+```
+`SetHealth` 又回到了前文的 `SetAttributeBaseValue` ，又触发了`PreAttributeChange`函数 钳制数值.<br>
+
+对于`PreAttributeChange`来说，现在有两条可以到达这里的路线，<br>
+第一条是前文的那一串逻辑， 第二条是`SetHealth`跳转过来的.<br>
+
+第二条路线:<br>
+
+![alt text](Lyra1/img4/image-16.png)
+
+```cpp
+virtual void PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) override;
+```
+`PreAttributeChange` 的`float`参数是引用来的，会修改外部的值.<br>
+
+第一条路线:
+```cpp
+void FActiveGameplayEffectsContainer::SetAttributeBaseValue(FGameplayAttribute Attribute, float NewBaseValue)
+{
+    Set->PreAttributeBaseChange(Attribute, NewBaseValue);
+    DataPtr->SetBaseValue(NewBaseValue);
+    InternalUpdateNumericalAttribute(Attribute, NewBaseValue, nullptr);
+    Set->PostAttributeBaseChange(Attribute, OldBaseValue, NewBaseValue);
+}
+```
+`PreAttributeBaseChange` 是引用参数 可以在里面钳制数值，<br>
+只要在这里钳制了数值，后面的参数都是钳制之后的:
+```cpp
+/* InternalExecuteMod */
+PreGameplayEffectExecute
+
+/* ApplyModToAttribute */
+
+/* 假设在这里就钳制 */
+PreAttributeBaseChange
+
+/* 以下函数使用的数值就是钳制过的 */
+
+PreAttributeChange
+PostAttributeChange
+PostAttributeBaseChange
+
+/* InternalExecuteMod */
+PostGameplayEffectExecute
+```
+
+`InternalUpdateNumericalAttribute` 并没有引用`NewBaseValue`，而是复制值.<br>
+所以`PreAttributeChange`虽然是引用参数， 但是并不会影响后面的`PostAttributeBaseChange`.
+
+在第二条路线中，`SetHealth` 触发 `SetNumericAttributeBase`，又执行一次钳制.
+
+---
+
 #### AbilitySystemComponent
 ##### 组件初始化
-这是 `ASC` 和 `AttributeSet` 的使用方式,
+这是 `ASC` 和 `AttributeSet` 的联动方式,
 ```cpp
 APlayerState::APlayerState()
 {
@@ -4719,7 +4916,7 @@ UAbilitySystemComponent::GiveAbility(const FGameplayAbilitySpec& Spec)
 
 ---
 
-那搞了半天 在激活技能时要区分`CDO`和`Instance`，为什么在蓝图中激活技能时要注意什么?<br>
+那搞了半天 技能要区分`CDO`和`Instance`，那么在激活技能时要注意什么?<br>
 “什么也不需要注意”.
 
 在蓝图中调用`TryActivateAbility`时，要传入一个`SpecHandle`，ASC根据`Handle`去找到并激活对应的`Spec`中的`Ability`.
@@ -6474,7 +6671,9 @@ SpawnedActor->CanceledDelegate.AddUObject(const_cast<UAbilityTask_WaitTargetData
 当玩家输入`确认`时(通常是按下左键 表示确定目标)，触发ASC的函数 广播委托，`TargetActor` 在收到广播后 计算数据并广播数据.<br>
 `WaitTargetData` 收到 `TargetActor`广播的数据，转发给蓝图引脚 `ValidData` .
 
-
+`WaitTargetData`是一个`UObject`类，在场景中生成一个`Actor`执行射线检测之类的事情，并且绑定这个`Actor`的委托<br>
+`Actor`在检测完以后，广播委托，`WaitTargetData`就可以收到`Actor`传来的`TargetData`.<br>
+之后就是蓝图节点的事情了，可以在蓝图里使用这个`TargetData`.
 
 
 ---
@@ -6505,7 +6704,7 @@ InvokeReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed, AbilitySpec-
 
 
 ---
-#### GE属性计算
+#### GE自定义计算
 
 ![alt text](Lyra1/img2/image-72.png)
 
@@ -6896,7 +7095,7 @@ void FActiveGameplayEffectsContainer::ExecuteActiveEffectsFrom(FGameplayEffectSp
 
 #### GE堆栈
 
-![alt text](Lyra1/img4/image.png)
+![alt text](Lyra1/img4/GEStacking.png)
 
 `StackingType` - 此`GameplayEffect`如何与同一`GameplayEffect`的其他实例叠加<br>
 `StackLimitCount` - `StackingType`对应的堆叠层数上限<br>
@@ -7046,6 +7245,190 @@ FActiveGameplayEffectsContainer::ApplyGameplayEffectSpec()
 `Spec` 即将应用的GE.
 
 TODO:不想写了，先放着吧.
+
+---
+
+#### TargetData
+
+```cpp
+/**
+*	TargetDataHandle 主要用途有两个：
+*		- 避免在蓝图中复制完整的目标数据结构
+*		- 允许我们利用目标数据结构的多态性
+*		- 允许我们实现 NetSerialize 并在客户端/服务器之间按值复制
+*
+*		- 原本可以使用 UObject 来提供多态性和在蓝图中通过引用传递。
+*		- 但在复制方面我们仍然会遇到问题
+*
+*		- 按值复制
+*		- 在蓝图中通过引用传递
+*		- 目标数据结构的多态性
+*/
+USTRUCT(BlueprintType)
+struct GAMEPLAYABILITIES_API FGameplayAbilityTargetDataHandle
+```
+
+---
+
+```cpp
+/**
+ *	TargetData的通用结构。我们希望通用函数生成这些数据，而其他通用函数使用这些数据。
+ *
+ *	我们希望它能够持有具体的 Actor/对象引用，以及通用的位置/方向/原点信息。
+ *
+ *	一些生成示例：
+ *		- 重叠/命中碰撞事件生成 关于近战攻击命中谁 的目标数据
+ *		- 鼠标输入触发命中追踪，准星前的 Actor 被转换为目标数据
+ *		- 鼠标输入导致从拥有者的准星视角原点/方向生成目标数据
+ *		- AOE/光环脉冲，将施法者周围半径内的所有 Actor 添加到目标数据
+ *		- 如《铁甲飞龙》风格的“涂抹”瞄准模式
+ *		- MMORPG 风格的地面 AOE 瞄准模式（可能同时包含地面上的位置和被瞄准的 Actor）
+ *
+ *	一些使用示例：
+ *		- 对目标数据中的所有 Actor 应用 GameplayEffect
+ *		- 从目标数据中的所有 Actor 中寻找最近的 Actor
+ *		- 对目标数据中的所有 Actor 调用某个函数
+ *		- 过滤或合并目标数据
+ *		- 在目标数据的位置生成一个新的 Actor
+ *
+ *	也许区分 Actor 列表瞄准与位置性瞄准数据会更好？
+ *		- AOE/光环类型的瞄准数据模糊了这种界限。
+ */
+USTRUCT()
+struct GAMEPLAYABILITIES_API FGameplayAbilityTargetData
+```
+
+还有铁甲飞龙的事?
+
+```
+“铁甲飞龙的涂抹”瞄准模式，是一种独特的多目标锁定机制。
+在该模式下，玩家移动屏幕上的准星（通常是龙背上的锁定环），当准星划过敌人时，敌人会被“涂抹”标记（即锁定）。
+玩家可以连续划过多个敌人，积累目标列表，然后一次性发射导弹或攻击，所有被标记的敌人都会受到追踪攻击。
+
+这种设计结合了区域覆盖与策略选择：
+玩家不需要精确瞄准单个目标，而是通过快速拖动准星来覆盖一群敌人，系统自动锁定路径上的所有目标。
+它既降低了操作精度要求，又提供了同时应对多个敌人的能力，成为《铁甲飞龙》标志性的玩法。
+
+在游戏开发中，这种模式可以作为目标数据生成的一个典型例子——即通过鼠标或触摸拖动，收集多个命中目标（Actor），生成一个包含多目标的目标数据句柄，供后续技能（如追踪导弹）使用。
+```
+
+---
+
+为什么需要 `FGameplayAbilityTargetData`？<br>
+在 GAS 中，一个技能(`GameplayAbility`)往往需要作用于特定的目标，例如：<br>
+近战攻击命中某个敌人。<br>
+鼠标点击对地面施放一个区域效果。<br>
+自动锁定多个敌人并发射导弹。<br>
+
+这些目标信息可能以不同形式存在：单个命中结果（FHitResult）、一组 Actor、空间位置等。<br>
+为了在技能逻辑中统一处理这些不同形式的数据，并能够可靠地在客户端和服务器之间同步，GAS 引入了 FGameplayAbilityTargetData 作为抽象基类。<br>
+
+统一接口：派生类各自实现 `GetActors`、`GetHitResult`、`GetEndPoint` 等方法，使技能可以以相同方式获取目标的位置、Actor 列表等信息。<br>
+
+多态性与网络序列化：通过 FGameplayAbilityTargetDataHandle 持有指向派生类的共享指针，并实现自定义的 NetSerialize，使得数据可以在网络上按值传递，同时保留实际类型。
+
+---
+
+基类 `FGameplayAbilityTargetData`<br>
+定义了所有目标数据必须实现的接口，大部分为纯虚函数（但基类提供了默认实现）。
+
+非虚方法 `ApplyGameplayEffectSpec` 和 `AddTargetDataToContext` 是通用工具函数，供子类复用。
+
+---
+
+`FGameplayAbilityTargetData_SingleTargetHit`<br>
+存储内容：一个 `FHitResult`<br>
+用途：最常见的形式，用于单次命中检测（如子弹、近战攻击）。<br>
+HitResult 包含了击中点、击中的 Actor、法线、Trace 起止点等信息。<br>
+
+重写 `GetActors`、`HasHitResult`、`GetHitResult`、`HasOrigin/GetOrigin`、`HasEndPoint/GetEndPoint`
+
+---
+
+`FGameplayAbilityTargetData_ActorArray`:<br>
+存储内容：一个 `SourceLocation` 和一个 `TargetActorArray` .<br>
+用途：用于多目标选择，例如范围光环、多目标锁定。<br>
+它记录了一组被选中的 Actor，并附带一个来源位置（用于计算方向）。<br>
+关键实现：<br>
+`GetActors` 直接返回 `TargetActorArray`。<br>
+`HasOrigin/GetOrigin` 返回 `SourceLocation` 的变换，并尝试根据第一个有效目标调整旋转，使其指向目标。
+`HasEndPoint/GetEndPoint` 返回第一个有效目标的位置。
+
+---
+
+
+`FGameplayAbilityTargetData_LocationInfo`:<br>
+存储内容：`SourceLocation` 和 `TargetLocation`。<br>
+用途：纯粹的位置信息，不涉及任何 `Actor`。适用于地面AOE、放置物等不需要目标 `Actor` 的场景。
+关键实现：<br>
+`HasOrigin/GetOrigin` 返回 `SourceLocation` 的变换。<br>
+`HasEndPoint/GetEndPointTransform` 返回 `TargetLocation` 的变换。<br>
+
+---
+
+![alt text](Lyra1/img4/img_TargetData_UML.png)
+
+---
+
+`FGameplayAbilityTargetingLocationInfo`:<br>
+这是一个辅助结构，用于描述一个空间位置，支持三种模式：<br>
+LiteralTransform：直接存储一个 FTransform。<br>
+ActorTransform：引用一个 SourceActor，取其当前变换。<br>
+SocketTransform：引用一个 MeshComponent 和 Socket 名称，获取该 Socket 的变换。<br>
+
+这种设计允许在生成目标数据时仅保存“如何获取位置”的信息，而不是具体的坐标值，从而在网络传输中更高效（例如只需引用 Actor 和 Socket 名，而不是每帧更新的坐标）。<br>
+`GetTargetingTransform `方法会在使用时根据当前状态实时计算位置。
+
+
+
+---
+
+`AbilitySystemBlueprintLibrary` 提供的相关函数:
+
+![alt text](Lyra1/img4/image-12.png)
+
+![alt text](Lyra1/img4/image-13.png)
+
+![alt text](Lyra1/img4/image-14.png)
+
+---
+
+GA可以调用`ApplyGameplayEffectToTarget`函数，直接对`TargetData`中的所有Actor 应用GE.
+
+获取`TargetDataHandle`中保存的`TargetData`.<br>
+调用`FGameplayAbilityTargetData::ApplyGameplayEffectSpec`.
+
+```cpp
+TArray<FActiveGameplayEffectHandle> FGameplayAbilityTargetData::ApplyGameplayEffectSpec(FGameplayEffectSpec& InSpec)
+{
+    TArray<TWeakObjectPtr<AActor> > Actors = GetActors();
+
+    for (TWeakObjectPtr<AActor>& TargetActor : Actors)
+    {
+        UAbilitySystemComponent* TargetComponent = UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(TargetActor.Get());
+
+		if (TargetComponent)
+		{
+			// We have to make a new effect spec and context here, because otherwise the targeting info gets accumulated and things take damage multiple times
+			FGameplayEffectSpec	SpecToApply(InSpec);
+			FGameplayEffectContextHandle EffectContext = SpecToApply.GetContext().Duplicate();
+			SpecToApply.SetContext(EffectContext);
+
+			AddTargetDataToContext(EffectContext, false);
+
+			AppliedHandles.Add(EffectContext.GetInstigatorAbilitySystemComponent()->ApplyGameplayEffectSpecToTarget(SpecToApply, TargetComponent, PredictionKey));
+		}
+    }
+}
+```
+
+遍历`Actors`，`ApplyGameplayEffectSpecToTarget`: 对`Actor`应用GE. <br>
+
+
+
+---
+
+`AbilityTask_WaitTargetData` : 前文分析过了，看前文.
 
 
 ---
@@ -8569,6 +8952,36 @@ void UGameplayAbility::ApplyCost()
 }
 ```
 
+---
+
+#### 切换武器
+
+切枪也是技能, 太变态了.
+
+![alt text](Lyra1/img4/image-7.png)
+
+`GA_QuickbarSlots` 监听了这个`Tag`的消息.
+
+![alt text](Lyra1/img4/image-8.png)
+
+```cpp
+ULyraQuickBarComponent::SetActiveSlotIndex_Implementation
+ULyraQuickBarComponent::EquipItemInSlot
+ULyraEquipmentManagerComponent::EquipItem
+
+FLyraEquipmentList::AddEntry()
+{
+    /*...*/
+    Result->SpawnEquipmentActors(EquipmentCDO->ActorsToSpawn);
+    /*...*/
+}
+```
+
+![alt text](Lyra1/img4/image-9.png)
+
+生成 附加 就这么简单.
+
+详细见下一章 `武器` .
 
 
 ---
@@ -8584,9 +8997,10 @@ void UGameplayAbility::ApplyCost()
 ![alt text](Lyra1/img2/image-54.png)
 
 这个类的碰撞函数就是拾取武器的过程<br>
-1.从`QuickBar`获得下一个空闲槽位。获取逻辑是遍历槽位，如果找到一个空指针的槽位 就返回索引，没有找到就返回`-1`.<br>
+1.从`QuickBar`获得下一个空闲槽位。<br>
+获取逻辑是遍历槽位，如果找到一个空指针的槽位 就返回索引，没有找到就返回`-1`.<br>
 2.如果索引是有效数字，执行后续的添加逻辑.<br>
-3.`ItemDefinition`传递给库存组件，库存创建物品后 再添加到`QuickBar`中，并且切换到拾取的武器槽位. 就是切到最新的枪.<br>
+3.把`ItemDefinition`传递给库存组件，库存创建物品后 再添加到`QuickBar`中，并且切换到拾取的武器槽位. 就是切到最新的枪.<br>
 4.`QuickBar`广播最新的槽，UI监听这个广播 对应的更新UI. 详情:`W_QuickBarSlot`
 
 ---
@@ -8594,8 +9008,10 @@ void UGameplayAbility::ApplyCost()
 
 `LyraInventory` 的 `Definition | Instance`
 
-`ID_Rifle`里面有很多`Fragment`，这些`Fragment`描述了物品的功能.<br>
-`InventoryFragmentPickupIcon`: 上图中的 `武器生成器` 使用了这个类里面定义的模型和颜色 用来描述生成器的外观.<br>
+
+`Definition`: <br>
+例如: `ID_Rifle`里面有很多`Fragment`，这些`Fragment`描述了物品的功能.<br>
+`InventoryFragmentPickupIcon`: 定义的模型和颜色，描述生成器的外观，以供上图中的`武器生成器`使用.<br>
 ```cpp
 ULyraInventoryManagerComponent::AddItemDefinition(TSubclassOf<ULyraInventoryItemDefinition> ItemDef /**/)
 FLyraInventoryList::AddEntry(TSubclassOf<ULyraInventoryItemDefinition> ItemDef /**/)
@@ -8603,60 +9019,202 @@ FLyraInventoryList::AddEntry(TSubclassOf<ULyraInventoryItemDefinition> ItemDef /
 /* 传递 ItemDef */
 NewEntry.Instance->SetItemDef(ItemDef);
 ```
-整体如图所示，`Instance` 引用 `Definition`，`Definition` 引用 `Fragment`.<br>
-`Component` 管理 `Instance`... 
+整体如图所示:<br>
+
+![alt text](Lyra1/img2/image-55.png)
+
+整个架构还是有点像`Actor - Component`，`Definition`可以包含各种`Fragment`，<br>
+`Fragment`共同组合出一个`Definition`，实际上就是把一些功能拆分出去，有扩展性.<br>
+
+`Definition`为`Instance`提供武器的信息 以及 行为.
 
 `InventoryManagerComponent`是`Controller`组件，在`ShootCore`中定义了添加组件的操作.
 
-![alt text](Lyra1/img2/image-55.png)
+---
+
+以`ID_Rifle`为例，说明这个架构的运行流程.
+
+
+![alt text](Lyra1/img4/image.png)
+
+当角色触碰到`武器生成器`时，发生了什么？
+
+
+`武器生成器`的外观:
+
+![alt text](Lyra1/img4/image-2.png)
+
+在`武器生成器`的构造函数中，获得`Item Definition`里的`PickupIcon`，用这里保存的信息 设置外观模型，文字，颜色.
+
+
+触碰到`武器生成器`时，获得角色身上的`Inventory` 库存组件:
+
+![alt text](Lyra1/img4/image-3.png)
+
+`AddItemDefinition`的行为 : 核心是`InventoryList.AddEntry()`
+
+```cpp
+ULyraInventoryItemInstance* ULyraInventoryManagerComponent::AddItemDefinition(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount)
+{
+	ULyraInventoryItemInstance* Result = nullptr;
+	if (ItemDef != nullptr)
+	{
+		Result = InventoryList.AddEntry(ItemDef, StackCount);
+		/*...*/
+	}
+	return Result;
+}
+```
 
 
 创建`Instance`:
 ```cpp
 ULyraInventoryItemInstance* FLyraInventoryList::AddEntry(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount)
 {
+    FLyraInventoryEntry& NewEntry = Entries.AddDefaulted_GetRef();
     NewEntry.Instance = NewObject<ULyraInventoryItemInstance>(/*...*/);
     NewEntry.Instance->SetItemDef(ItemDef);
+
+    for (ULyraInventoryItemFragment* Fragment : GetDefault<ULyraInventoryItemDefinition>(ItemDef)->Fragments)
+	{
+		if (Fragment != nullptr)
+		{
+			Fragment->OnInstanceCreated(NewEntry.Instance);
+		}
+	}
+    Result = NewEntry.Instance;
+    /*...*/
+    return Result;
 }
 ```
 
-在`AddEntry`中，将`ItemDef`传给了`Instance`，<br>
-`ULyraInventoryItemInstance` 就知道了它使用了哪一个`ULyraInventoryItemDefinition`.<br>
+`SetItemDef(ItemDef)`，将 `ItemDef` 传给了新创建出来的 `Instance`，<br>
 
-`Instance`创建完成以后，通知`Definition`的`Fragment`，并将`Instance`传递给`Fragment`.<br>
+`Instance`创建完成以后，通知`Definition`的`Fragment`，并将`Instance`传递过去.<br>
 最后，`AddEntry`返回`Instance`.
+
+实际上，现在只有`UInventoryFragment_SetStats`这个类 实现了`OnInstanceCreated`函数.<br>
+```cpp
+void UInventoryFragment_SetStats::OnInstanceCreated(ULyraInventoryItemInstance* Instance) const
+{
+	for (const auto& KVP : InitialItemStats)
+	{
+		Instance->AddStatTagStack(KVP.Key, KVP.Value);
+	}
+}
+```
+在创建`Instance`后，`SetStats::OnInstanceCreated` 把下图中的`Tag`以及数量 设置给`Instance`.
+
+![alt text](Lyra1/img4/image-4.png)
+
+---
 
 添加`Instance`:
 
+![alt text](Lyra1/img4/image-3.png)
+
 `AddItemToSlot` 将创建出来的`Instance` 添加到 `QuickBar::Slots`中，然后广播整个槽的数据，<br>
 将所有的`Instance`都广播出去，`W_QuickBarSlot` 监听了 `SlotsChanged`. 通过自己的ID去找`Slots`中对应的`Instance`.
+
+```cpp
+void ULyraQuickBarComponent::AddItemToSlot(int32 SlotIndex, ULyraInventoryItemInstance* Item)
+{
+	if (Slots.IsValidIndex(SlotIndex) && (Item != nullptr))
+	{
+		if (Slots[SlotIndex] == nullptr)
+		{
+			Slots[SlotIndex] = Item;
+			OnRep_Slots();
+		}
+	}
+}
+
+void ULyraQuickBarComponent::OnRep_Slots()
+{
+	FLyraQuickBarSlotsChangedMessage Message;
+	Message.Owner = GetOwner();
+	Message.Slots = Slots;
+
+	UGameplayMessageSubsystem& MessageSystem = UGameplayMessageSubsystem::Get(this);
+	MessageSystem.BroadcastMessage(TAG_Lyra_QuickBar_Message_SlotsChanged, Message);
+}
+```
 
 ---
 
 装备武器：
 
+![alt text](Lyra1/img4/image-5.png)
+
 `LyraQuickBarComponent` 是`Controller`组件，在`LAS_ShooterGame_StandardComponents`中定义了添加组件的操作.
 ```cpp
+void ULyraQuickBarComponent::SetActiveSlotIndex_Implementation(int32 NewIndex)
+{
+	if (Slots.IsValidIndex(NewIndex) && (ActiveSlotIndex != NewIndex))
+	{
+		UnequipItemInSlot();
+
+		ActiveSlotIndex = NewIndex;
+
+		EquipItemInSlot();
+
+		OnRep_ActiveSlotIndex();
+	}
+}
+
 ULyraQuickBarComponent::SetActiveSlotIndex_Implementation
 ULyraQuickBarComponent::EquipItemInSlot
 ULyraEquipmentManagerComponent::EquipItem
 FLyraEquipmentList::AddEntry
 ```
+`SetActiveSlotIndex` 将传进来的`NewIndex`保存起来，后面要根据`Index`找到之前的装备.
 
-在之前已经`AddItemToSlot`将`InventoryItemInstance`存入`QuickBar`.<br>
-`EquipItemInSlot` 从`InventoryItemInstance` 中找到`Fragment_EquippableItem`，装备到`EquipmentManager`.<br>
+在之前已经`AddItemToSlot`将`InventoryItemInstance`存入`QuickBar`.
+
+`EquipItemInSlot` 根据 `Index` 找到 `InventoryItemInstance` .<br>
+再获得`ItemInstance`的`Fragment_EquippableItem`，装备到`EquipmentManager`.<br>
 
 ![alt text](Lyra1/img2/image-56.png)
 
-`FLyraEquipmentList::AddEntry` :<br>
+---
+
+接上图中的`EquippedItem = EquipmentManager->EquipItem(EquipDef);`.
+
+```cpp
+ULyraEquipmentInstance* ULyraEquipmentManagerComponent::EquipItem(TSubclassOf<ULyraEquipmentDefinition> EquipmentClass)
+{
+	ULyraEquipmentInstance* Result = nullptr;
+	if (EquipmentClass != nullptr)
+	{
+		Result = EquipmentList.AddEntry(EquipmentClass);
+		if (Result != nullptr)
+		{
+			Result->OnEquipped();
+
+			/*...*/
+		}
+	}
+	return Result;
+}
+```
+`FLyraEquipmentList::AddEntry` : 这个函数有点长，简单描述一下. <br>
 又是同样的 使用`EquipmentDefinition`来配置`EquipmentInstance`.<br>
 使用`Definition` 的 `InstanceType` 创建对应的`EquipmentInstance`.<br>
 配置`Definition`的技能，生成配置中的`Actor`并附加到角色上.<br>
 
 ![alt text](Lyra1/img2/image-57.png)
 
-例如`ID_Pistol - WID_Pistrol` 的 `Instance Type`  是武器类的`Instance`.<br>
-`EquipItem` 调用 `Result->OnEquipped()` ，最后在蓝图里重写`K2_OnEquipped` 用来播放切枪动画.<br>
+![alt text](Lyra1/img4/image-6.png)
+
+注意这里技能的`SourceObject`是`EquipmentInstance`.<br>
+GA可以通过`SourceObject` 获得 `EquipmentInstance`.
+
+回到上文的`EquipItem`函数，后面还有一行 `Result->OnEquipped();`.
+
+
+例如`ID_Rifle - WID_Rifle` 的 `Instance Type`  是武器类的`Instance`.<br>
+`EquipItem` 调用 `Result->OnEquipped()` ，<br>
+在蓝图里重写了 `K2_OnEquipped` 用来执行拾取时的事件，例如播放切枪动画.<br>
 `B_WeaponInstance_Pistol` 里面就配置了各种需要的武器动画.
 
 取消装备：
@@ -8897,6 +9455,25 @@ Anim Layer Applied (应用的动画层)
 - 协调客户端-服务器同步
 - 处理命中检测和伤害应用
 
+
+![alt text](Lyra1/img4/image-10.png)
+
+```cpp
+void ULyraGameplayAbility_RangedWeapon::StartRangedWeaponTargeting()
+{
+    /*...*/
+    TArray<FHitResult> FoundHits;
+	PerformLocalTargeting(/*out*/ FoundHits);
+
+    /*...*/
+
+    // Process the target data immediately
+	OnTargetDataReadyCallback(TargetData, FGameplayTag());
+}
+```
+
+`PerformLocalTargeting` 比较关键:
+
 ```cpp
 void ULyraGameplayAbility_RangedWeapon::PerformLocalTargeting(OUT TArray<FHitResult>& OutHits)
 {
@@ -9037,32 +9614,106 @@ void ULyraGameplayAbility_RangedWeapon::PerformLocalTargeting(OUT TArray<FHitRes
 `StartTrace` 使用新的摄像机位置，黄球位置<br>
 `EndAim` 终点 = 起点 + 方向 * 距离<br>
 
+---
 
 `TraceBulletsInCartridge` 根据每发弹药的子弹数 做N次射线检测，例如:散弹枪 开一枪有好几发子弹.做好几次射线检测.
 
 ```cpp
-ULyraRangedWeaponInstance* WeaponData = GetWeaponInstance();
-FRangedWeaponFiringInput InputData;
-InputData.WeaponData = WeaponData;
-```
-
-在库存系统添加武器时，把定义中的`AbilitySetsToGrant` 添加到了ASC中.<br>
-`GiveToAbilitySystem` 的第三个参数是`SourceObject` ， 传入的是 `Instance`.
-```cpp
-NewEntry.Instance = NewObject<ULyraEquipmentInstance>(OwnerComponent->GetOwner(), InstanceType); 
-
-Result = NewEntry.Instance;
-
-for (TObjectPtr<const ULyraAbilitySet> AbilitySet : EquipmentCDO->AbilitySetsToGrant)
+void ULyraGameplayAbility_RangedWeapon::TraceBulletsInCartridge()
 {
-    AbilitySet->GiveToAbilitySystem(ASC, /*inout*/ &NewEntry.GrantedHandles, Result);
+    ULyraRangedWeaponInstance* WeaponData = GetWeaponInstance();
+    const int32 BulletsPerCartridge = WeaponData->GetBulletsPerCartridge();
+    for (int32 BulletIndex = 0; BulletIndex < BulletsPerCartridge; ++BulletIndex)
+    {
+        /*...*/
+    }
 }
+```
+`BulletsPerCartridge` 开一次枪要消耗多少子弹？<br>
+如果用的是喷子，一次开枪可能要发射5发子弹.<br>
+这5发子弹 每一发都要检测命中目标.
 
-/* ... */
-void GiveToAbilitySystem(/*...*/ UObject* SourceObject = nullptr) const;
+计算散布方向:<br>
+从武器实例获取基础散布角度（BaseSpreadAngle）和散布乘数（SpreadAngleMultiplier），两者相乘得到实际散布角度 ActualSpreadAngle。<br>
+将实际角度的一半转换为弧度（HalfSpreadAngleInRadians），用于定义圆锥的半角。<br>
+调用 `VRandConeNormalDistribution` 函数，在理想瞄准方向（InputData.AimDir）周围随机生成一个方向向量：<br>
+- 圆锥半角由散布角度决定。<br>
+- 指数（SpreadExponent）控制分布形态
+- 指数越大，子弹越倾向于集中在圆锥中心（类似正态分布）；
+- 指数越小，分布越均匀。<br>
+此方向即为该子弹的最终飞行方向 BulletDir。
+
+终点 = 起始点 + 子弹方向 × 武器最大伤害范围（GetMaxDamageRange()）。
+
+`DoSingleBulletTrace` 单发子弹追踪:<br>
+传入起始点、终点、武器扫掠半径（GetBulletTraceSweepRadius()）、模拟标志（false）以及一个临时数组 AllImpacts。<br>
+`DoSingleBulletTrace` 会先尝试精确的线检测（无半径），若未命中任何 `Pawn` 且扫掠半径 > 0，则用球体扫掠再试一次，最终返回主要命中点（Impact）和所有命中结果（AllImpacts）。
+
+
+处理命中结果:<br>
+如果 Impact 命中了某个 Actor（即 Impact.GetActor() 不为空）：<br>
+将 AllImpacts 中的所有命中结果追加到最终的 OutHits 数组中。<br>
+同时可能进行调试绘制（DrawDebugPoint），显示命中点。<br>
+
+如果 OutHits 仍为空（即没有任何命中）：<br>
+为了保证后续逻辑（如子弹轨迹特效、客户端预测）能正常工作，函数会向 OutHits 中添加一个“伪命中”结果：<br>
+若 Impact 本身不是阻挡命中（即未命中任何物体），则将其位置设为终点（EndTrace），并更新 ImpactPoint 和 Location。<br>
+然后将这个 Impact 添加到 OutHits 中。<br>
+
+这样，即使子弹完全打空，后续代码（如生成目标数据、播放弹道特效）也能获得一个表示轨迹终点的有效数据。
+
+---
+
+回到主线:
+
+```cpp
+void ULyraGameplayAbility_RangedWeapon::StartRangedWeaponTargeting()
+{
+    TArray<FHitResult> FoundHits;
+	PerformLocalTargeting(/*out*/ FoundHits);
+
+    for (const FHitResult& FoundHit : FoundHits)
+    {
+        TargetData.Add(NewTargetData);
+    }
+
+
+    // Process the target data immediately
+	OnTargetDataReadyCallback(TargetData, FGameplayTag());
+}
 ```
 
-所以在开枪技能中 只要获得`SourceObject` 就是武器的`Instance`.
+把射线检测的结果 存到`TargetData`.
+
+检查子弹，有子弹--->蓝图逻辑.  没子弹--->结束技能.
+```cpp
+void ULyraGameplayAbility_RangedWeapon::OnTargetDataReadyCallback(const FGameplayAbilityTargetDataHandle& InData, FGameplayTag ApplicationTag)
+{
+    FGameplayAbilityTargetDataHandle LocalTargetDataHandle(MoveTemp(const_cast</*...*/&>(InData)));
+    // See if we still have ammo
+	if (bIsTargetDataValid && CommitAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo))
+	{
+		// We fired the weapon, add spread
+		ULyraRangedWeaponInstance* WeaponData = GetWeaponInstance();
+		check(WeaponData);
+		WeaponData->AddSpread();
+
+		// Let the blueprint do stuff like apply effects to the targets
+		OnRangedWeaponTargetDataReady(LocalTargetDataHandle);
+	}
+	else
+	{
+		UE_LOG(LogLyraAbilitySystem, Warning, TEXT("Weapon ability %s failed to commit (bIsTargetDataValid=%d)"), *GetPathName(), bIsTargetDataValid ? 1 : 0);
+		K2_EndAbility();
+	}
+}
+```
+
+在蓝图中处理击中逻辑，应用伤害.
+
+![alt text](Lyra1/img4/image-11.png)
+
+
 
 
 ---
@@ -9074,7 +9725,25 @@ void GiveToAbilitySystem(/*...*/ UObject* SourceObject = nullptr) const;
 
 TODO
 
+---
+
+
+#### 弹道轨迹
+
+TODO
+
+
+---
+
 #### 准星扩散
+```
+武器的散布可以被想象成一个圆锥形状。
+为了在准星可视化中计算屏幕空间的散布半径，我们在一个很远的距离上创建一条位于圆锥边缘的线。
+该线的端点位于圆锥截面的边缘。
+然后我们将其投影回屏幕，该点与屏幕中心的距离就是散布半径。
+
+由于摄像机位置与枪口位置之间存在一定距离，这种方法并不完美。
+```
 
 TODO
 
@@ -9082,6 +9751,42 @@ TODO
 
 ### 队伍与战斗UI
 ```cpp
+UENUM(BlueprintType)
+namespace ETeamAttitude
+{
+	enum Type : int
+	{
+		Friendly,
+		Neutral,
+		Hostile,
+	};
+}
+
+USTRUCT(BlueprintType)
+struct FGenericTeamId
+{
+    UPROPERTY(Category = "TeamID", EditAnywhere, BlueprintReadWrite)
+	uint8 TeamID;
+}
+
+class IGenericTeamAgentInterface
+{
+    virtual void SetGenericTeamId(const FGenericTeamId& TeamID) {}
+    virtual FGenericTeamId GetGenericTeamId() const { return FGenericTeamId::NoTeam; }
+
+    virtual ETeamAttitude::Type GetTeamAttitudeTowards(const AActor& Other) const
+    {
+        /*...*/
+    };
+}
+```
+引擎给的队伍接口提供了队伍ID 和 队友判断 的功能.
+
+---
+
+```cpp
+class ILyraTeamAgentInterface : public IGenericTeamAgentInterface
+
 class ALyraCharacter :public ILyraTeamAgentInterface;
 class ALyraPawn : public ILyraTeamAgentInterface;
 class ULyraLocalPlayer : public ILyraTeamAgentInterface;
