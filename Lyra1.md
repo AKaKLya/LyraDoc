@@ -4090,7 +4090,6 @@ bool UGameplayEffect::CanApply(const FActiveGameplayEffectsContainer& ActiveGECo
     {
         if (GEComponent && !GEComponent->CanGameplayEffectApply(ActiveGEContainer, GESpec))
         {
-            UE_VLOG(ActiveGEContainer.Owner, LogAbilitySystem, Verbose, TEXT("%s could not apply. Blocked by %s"), *GetNameSafe(GESpec.Def), *GetNameSafe(GEComponent));
             return false;
         }
     }
@@ -6043,7 +6042,7 @@ void UTargetTagsGameplayEffectComponent::ApplyTargetTagChanges() const
 }
 ```
 
-GE的`CachedGrantedTags`: 通过Get函数获取.
+GE的`CachedGrantedTags`: 外部可以通过Get函数获取.
 ```cpp
 class UGameplayEffect : public UObject, public IGameplayTagAssetInterface
 {
@@ -6092,12 +6091,14 @@ class UAbilitySystemComponent : /*...*/
 ```
 
 `GameplayTagCountContainer` 是一个包含Tag的容器，它的作用是:<br>
+保存GE和Cue的标签.<br>
 有时候 会询问ASC有没有某一个GameplayTag，背后查询的就是这个容器.
 
 ---
 
+##### 技能冷却
+
 除此之外，`TargetTagsGameplayEffectComponent` 还有一个用途: 技能冷却.<br>
-`UGameplayAbility::CheckCooldown` 调用了`GetCooldownTags` 函数.<br>
 ```cpp
 /** Returns all tags that can put this ability into cooldown */
 const FGameplayTagContainer* UGameplayAbility::GetCooldownTags() const
@@ -6105,22 +6106,17 @@ const FGameplayTagContainer* UGameplayAbility::GetCooldownTags() const
     UGameplayEffect* CDGE = GetCooldownGameplayEffect();
     return CDGE ? &CDGE->GetGrantedTags() : nullptr;
 }
-```
-`CheckCooldown` :<br>
-获取GA中配置的 `冷却GE` 的标签，询问ASC有没有这个 `冷却GE` 的标签，<br>
-如果有，说明正在冷却中，返回false，不能执行GA.<br>
-如果没有，说明冷却完毕，返回true，可以执行GA.
-```cpp
-bool UGameplayAbility::CheckCooldown(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, OUT FGameplayTagContainer* OptionalRelevantTags) const
+
+bool UGameplayAbility::CheckCooldown(/*..*/) const
 {
     const FGameplayTagContainer* CooldownTags = GetCooldownTags();
     if (CooldownTags)
     {
         if (CooldownTags->Num() > 0)
         {
-            UAbilitySystemComponent* const AbilitySystemComponent = ActorInfo->AbilitySystemComponent.Get();
-            check(AbilitySystemComponent != nullptr);
-            if (AbilitySystemComponent->HasAnyMatchingGameplayTags(*CooldownTags))
+            UAbilitySystemComponent* const ASC = /*..*/
+          
+            if (ASC->HasAnyMatchingGameplayTags(*CooldownTags))
             {
                 return false;
             }
@@ -6129,9 +6125,22 @@ bool UGameplayAbility::CheckCooldown(const FGameplayAbilitySpecHandle Handle, co
     return true;
 }
 ```
+`CheckCooldown` :<br>
+获取GA中配置的 `冷却GE` 的标签，询问ASC有没有这个 `冷却GE` 的标签，<br>
+如果有，说明正在冷却中，返回false，不能执行GA.<br>
+如果没有，说明冷却完毕，返回true，可以执行GA.
+
+`冷却GE`的标签可以是任何标签，<br>
+在`GA`中调用`CommitAbilityCooldown`时，<br>
+`ApplyGameplayEffectToOwner`:应用`冷却GE`.<br>
+`GameplayTagCountContainer` 将会保存`冷却GE`中的`Tag`.
+
+下一次执行技能时，`CheckCooldown`检查`GameplayTagCountContainer`里面有没有`冷却GE`的Tag.<br>
+
 所以 `冷却GE` 的用法是:<br>
 配置GE的持续时长，这个时长就是冷却时长.<br>
 向GE添加表示技能冷却的标签， 最后将这个GE配置给GA的`冷却GE`.
+
 
 ----
 
