@@ -5773,13 +5773,64 @@ class GAMEPLAYABILITIES_API UGameplayEffect
 
 所以GEComponent需要重写`OnGameplayEffectChanged`函数 以修改这些Tag.
 
+这个`GE组件`向`GE`的`CachedAssetTags`添加Tag.
+
 ---
 
 ##### BlockAbilityTagsGameplayEffectComponent
 ```cpp
 /** 处理基于Tag阻止游戏技能激活的功能，针对拥有此GE的目标角色（Target actor） */
 ```
-运行机制与 `AssetTagsGameplayEffectComponent` 相同.
+向`GE`的`CachedBlockedAbilityTags`添加Tag.
+
+```cpp
+const FGameplayTagContainer& GetBlockedAbilityTags() const { return CachedBlockedAbilityTags; }
+
+void FActiveGameplayEffectsContainer::AddActiveGameplayEffectGrantedTagsAndModifiers
+{
+    // Update our owner with the blocked ability tags this GameplayEffect adds to them
+	Owner->BlockAbilitiesWithTags(Effect.Spec.Def->GetBlockedAbilityTags());
+}
+
+void UAbilitySystemComponent::BlockAbilitiesWithTags(const FGameplayTagContainer& Tags)
+{
+	BlockedAbilityTags.UpdateTagCount(Tags, 1);
+}
+```
+在应用这个`GE`时，`ASC`将`CachedBlockedAbilityTags`的内容保存到`BlockedAbilityTags`.<br>
+
+```cpp
+UAbilitySystemComponent::TryActivateAbility
+UAbilitySystemComponent::InternalTryActivateAbility
+UGameplayAbility::CanActivateAbility
+
+bool UGameplayAbility::DoesAbilitySatisfyTagRequirements
+{
+    if (AbilitySystemComponent.AreAbilityTagsBlocked(AbilityTags))
+	{
+		bBlocked = true;
+	}
+
+    if (bBlocked)
+	{
+		if (OptionalRelevantTags && BlockedTag.IsValid())
+		{
+			OptionalRelevantTags->AddTag(BlockedTag);
+		}
+		return false;
+	}
+}
+
+bool UAbilitySystemComponent::AreAbilityTagsBlocked(const FGameplayTagContainer& Tags) const
+{
+	// Expand the passed in tags to get parents, not the blocked tags
+	return Tags.HasAny(BlockedAbilityTags.GetExplicitGameplayTags());
+}
+```
+
+激活技能时，检查`GA`的`AbilityTags` 是否在`CachedBlockedAbilityTags`中.<br>
+如果这个技能被阻挡了，返回`false` 不满足技能的激活要求.
+
 
 ---
 ##### ChanceToApplyGameplayEffectComponent
