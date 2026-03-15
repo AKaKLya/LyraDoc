@@ -3724,6 +3724,43 @@ PostGameplayEffectExecute
 
 ---
 
+
+##### Tick
+
+`UAttributeSet` 是`UObject`类，本身就可以`Tick`.
+
+但是`GAS`提供了一个在`ASC`组件中调用的`Tick`接口.
+
+```cpp
+/** 用于表示需要勾选以更新状态的属性集的接口。这些属性集可能较为耗时 */
+class ITickableAttributeSetInterface
+{
+	GENERATED_IINTERFACE_BODY()
+public:
+	virtual void Tick(float DeltaTime) = 0;
+	virtual bool ShouldTick() const = 0;
+};
+```
+
+```cpp
+void UAbilitySystemComponent::TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction *ThisTickFunction)
+{	
+	/*...*/
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+	for (UAttributeSet* AttributeSet : GetSpawnedAttributes())
+	{
+		ITickableAttributeSetInterface* TickableSet = Cast<ITickableAttributeSetInterface>(AttributeSet);
+		if (TickableSet && TickableSet->ShouldTick())
+		{
+			TickableSet->Tick(DeltaTime);
+		}
+	}
+}
+```
+
+---
+
 #### AbilitySystemComponent
 ##### 组件初始化
 这是 `ASC` 和 `AttributeSet` 的联动方式,
@@ -3962,7 +3999,7 @@ Handle UAbilitySystemComponent::ApplyGameplayEffectSpecToSelf(const FGameplayEff
 
 `UImmunityGameplayEffectComponent`允许特定的 `GameplayEffect` 阻止其他效果的应用。
 ```cpp
-class GAMEPLAYABILITIES_API UImmunityGameplayEffectComponent : public UGameplayEffectComponent
+class UImmunityGameplayEffectComponent : public UGameplayEffectComponent
 {
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = None)
     TArray<FGameplayEffectQuery> ImmunityQueries;
@@ -5187,9 +5224,12 @@ UPROPERTY(/**/)
 FGameplayTagContainer AbilityTags;
 ```
 
-用到了`AbilityTags`的相关函数 `TryActivateAbilitiesByTag`. <br>
+用到`AbilityTags`的相关函数: <br>
+`TryActivateAbilitiesByTag`. <br>
 ASC利用`AbilityTags`查找技能，从而实现根据`Tag`激活技能:<br>
+
 `GetActivatableGameplayAbilitySpecsByAllMatchingTags`<br>
+
 `FindAllAbilitiesWithTags`<br>
 在 `ActivatableAbilities` 容器中，查找拥有此标签的 `AbilitySpec`.
 
@@ -5751,7 +5791,7 @@ void UAdditionalEffectsGameplayEffectComponent::OnGameplayEffectApplied(FActiveG
 
 GE有以下Tag : 
 ```cpp
-class GAMEPLAYABILITIES_API UGameplayEffect
+class UGameplayEffect
 {
     // ----------------------------------------------------------------------
     //	Cached Component Data - Do not modify these at runtime!
@@ -6008,6 +6048,7 @@ bool UImmunityGameplayEffectComponent::AllowGameplayEffectApplication(const FAct
 }
 ```
 
+---
 
 ##### TargetTagRequirementsGameplayEffectComponent
 `ApplicationTagRequirements `:<br>
@@ -6650,6 +6691,108 @@ AGameplayCueNotify_BurstLatent::OnExecute_Implementation()
 
 ---
 ##### WaitTargetData
+
+**设计思路**
+
+在`GA`中 生成一个`TargetActor`用来做射线检测，<br>
+当按下鼠标时 得到射线检测的结果.
+
+如何实现?<br>
+`GA`可以通过`ASC`响应按键，确认或取消.<br>
+`ASC`向`GA`传递 `按下` 的消息时，`Actor`就要响应按下的消息 返回射线检测的结果.
+
+`TargetActor`如何响应`按下`消息?<br>
+`WaitTargetData`在生成`TargetActor`之后，让`TargetActor`监听`ASC`的`确认`消息，<br>
+
+`ASC - 确认与取消` : 按键绑定
+```cpp
+template <class UserClass, class FuncType>
+void UInputComponent::BindNativeAction(const UInputConfig* InputConfig, const FGameplayTag& InputTag,ETriggerEvent TriggerEvent, UserClass* User, FuncType Func)
+{
+	UInputAction* Action = InputConfig->FindNativeActionByTag(InputTag);
+	if (Action)
+	{
+		BindAction(Action,TriggerEvent,User,Func);
+	}
+}
+
+EnhancedInputComponent->BindNativeAction(InputConfig,CryGameplayTags::Confirm,ETriggerEvent::Triggered,ASC,&UAbilitySystemComponent::LocalInputConfirm);
+
+EnhancedInputComponent->BindNativeAction(InputConfig,CryGameplayTags::Cancel,ETriggerEvent::Triggered,ASC,&UAbilitySystemComponent::LocalInputCancel);
+```
+绑定按键之后，按下对应的按钮 ASC就可以响应`确认与取消`.
+
+```cpp
+void UAbilityTask_WaitTargetData::FinalizeTargetActor(AGameplayAbilityTargetActor* SpawnedActor) const
+{
+    if (ConfirmationType == EGameplayTargetingConfirmation::UserConfirmed)
+	{
+		// Bind to the Cancel/Confirm Delegates (called from local confirm or from repped confirm)
+		SpawnedActor->BindToConfirmCancelInputs();
+	}
+}
+
+void AGameplayAbilityTargetActor::BindToConfirmCancelInputs()
+{
+    // Tell me if the confirm input is pressed
+    ASC->GenericLocalConfirmCallbacks.AddDynamic(this, &AGameplayAbilityTargetActor::ConfirmTargeting);	
+
+    // Tell me if the cancel input is pressed
+	ASC->GenericLocalCancelCallbacks.AddDynamic(this, &AGameplayAbilityTargetActor::CancelTargeting);	
+}
+
+void AGameplayAbilityTargetActor::ConfirmTargeting()
+{
+    if (IsConfirmTargetingAllowed())
+	{
+		ConfirmTargetingAndContinue();
+		if (bDestroyOnConfirmation)
+		{
+			Destroy();
+		}
+	}
+}
+```
+
+`ConfirmTargetingAndContinue` 是虚函数，在子类中重写，实现自定义行为，例如:按下`确认`按键时 执行射线检测.
+
+```cpp
+void AGameplayAbilityTargetActor::ConfirmTargetingAndContinue()
+{
+	check(ShouldProduceTargetData());
+	if (IsConfirmTargetingAllowed())
+	{
+		TargetDataReadyDelegate.Broadcast(FGameplayAbilityTargetDataHandle());
+	}
+}
+```
+
+通过`TargetDataReadyDelegate` 把`TargetData`广播出去. 广播给谁？
+
+广播给`WaitTargetData`.
+```cpp
+void UAbilityTask_WaitTargetData::InitializeTargetActor(AGameplayAbilityTargetActor* SpawnedActor) const
+{
+    // If we spawned the target actor, always register the callbacks for when the data is ready.
+	SpawnedActor->TargetDataReadyDelegate.AddUObject(const_cast<UAbilityTask_WaitTargetData*>(this), &UAbilityTask_WaitTargetData::OnTargetDataReadyCallback);
+
+	SpawnedActor->CanceledDelegate.AddUObject(const_cast<UAbilityTask_WaitTargetData*>(this), &UAbilityTask_WaitTargetData::OnTargetDataCancelledCallback);
+}
+
+void UAbilityTask_WaitTargetData::OnTargetDataReadyCallback(const FGameplayAbilityTargetDataHandle& Data)
+{
+    if (ShouldBroadcastAbilityTaskDelegates())
+	{
+		ValidData.Broadcast(Data);
+	}
+}
+```
+`WaitTargetData` 拿到`TargetData`后，广播给蓝图的执行引脚.<br>
+
+`ShouldBroadcastAbilityTaskDelegates` 检查`Ability`有没有被取消，<br>
+如果取消了 就返回`false`，不向蓝图引脚广播`TargetData`.
+
+---
 
 `AbilityTask_WaitTargetData`:<br>
 等待从参数生成的目标选择Actor提供数据。可以设置为在输出数据时不结束。可以通过任务名称结束。
@@ -7325,7 +7468,7 @@ TODO:不想写了，先放着吧.
 *		- 目标数据结构的多态性
 */
 USTRUCT(BlueprintType)
-struct GAMEPLAYABILITIES_API FGameplayAbilityTargetDataHandle
+struct FGameplayAbilityTargetDataHandle
 ```
 
 ---
@@ -7355,7 +7498,7 @@ struct GAMEPLAYABILITIES_API FGameplayAbilityTargetDataHandle
  *		- AOE/光环类型的瞄准数据模糊了这种界限。
  */
 USTRUCT()
-struct GAMEPLAYABILITIES_API FGameplayAbilityTargetData
+struct FGameplayAbilityTargetData
 ```
 
 还有铁甲飞龙的事?
@@ -7492,6 +7635,103 @@ TArray<FActiveGameplayEffectHandle> FGameplayAbilityTargetData::ApplyGameplayEff
 
 
 ---
+
+#### Aggregator
+
+`GameplayAbilities/Public/GameplayEffectAggregator.h`
+```cpp
+struct FAggregator : public TSharedFromThis<FAggregator>
+{}
+```
+
+`Aggregator` 是属性的“实时计算器”。<br>
+它让 `AttributeSet` 能够应对复杂的 `Duration` 和 `Infinite` 效果，<br>
+确保数值在叠加、移除和被标签抑制时，逻辑依然清晰且符合数学顺序。<br>
+在 Lyra 中，它是保证战斗数值平衡的基础底层。
+
+用于处理和`聚合`游戏属性（如生命值、攻击力等）的类。<br>
+它在 `GAS` 中扮演着重要的角色，特别是在处理属性修饰符（modifiers）时。<br>
+`FAggregator` 的主要作用是管理和计算这些属性的最终值，同时考虑各种修饰符和标签要求.
+
+"聚合"是指将多个修饰符应用到一个属性上，并计算出最终属性值的过程。<br>
+`FAggregator` 类负责管理和执行这个过程，确保修饰符按正确的顺序应用，并根据标签要求进行过滤和条件化。<br>
+这使得游戏中的属性管理更加灵活和精确。
+
+收集修饰符:<br>
+`FAggregator` 会收集所有与特定属性相关的修饰符。<br>
+这些修饰符可以来自不同的`GE`，并且可以是加法、乘法、除法或覆盖操作。<br>
+
+过滤和条件化:<br>
+在应用修饰符之前，`FAggregator` 会根据 `SourceTags` 和 `TargetTags` 来过滤和条件化这些修饰符。<br>
+只有当修饰符的标签要求满足时，它们才会被应用。<br>
+例如，如果一个修饰符要求目标具有特定的标签（如“友军”），那么只有当 `TargetTags` 包含这个标签时，该修饰符才会被考虑。<br>
+
+按顺序应用修饰符:<br>
+修饰符按照一定的顺序应用。通常，乘法和除法修饰符会在加法修饰符之前应用，以确保正确的数学运算顺序。<br>
+例如，假设有一个基础值为 `100` 的属性，有一个乘法修饰符（*1.5）和一个加法修饰符（+50）。<br>
+首先应用乘法修饰符：`100 * 1.5 = 150`，然后应用加法修饰符：`150 + 50 = 200`。<br>
+
+计算最终值:<br>
+经过上述步骤后，`FAggregator` 会计算出属性的最终值。这个值是所有符合条件的修饰符应用后的结果。<br>
+
+---
+
+当查询一个属性（如 MoveSpeed）的当前值时，系统并不是简单地返回一个数字，<br>
+而是通过 `Aggregator` 将该属性上挂载的所有 `GE修改器` 进行动态求值.<br>
+
+**为什么需要 Aggregator？** <br>
+如果一个属性只有 BaseValue（基础值），计算很简单（100 + 10 = 110）。<br>
+但在实际游戏中，属性会受到多种因素影响：<br>
+永久改变：升级加了 5 点力量（修改 BaseValue）。<br>
+持续 Buff：加速药水提供 20% 移速（Duration GE）。<br>
+光环效果：站在旗帜旁增加 10 点防御（Infinite GE）。<br>
+标签抑制：如果角色被“禁速”，所有的速度 Buff 都要失效。<br>
+
+`Aggregator` 的作用就是把这些乱七八糟的修改器聚合在一起，按照预定的数学顺序算出最终的 `CurrentValue`。
+
+**Aggregator 的计算顺序（求值逻辑）** <br>
+当 `Aggregator` 对一个属性进行求值时，它会严格遵循以下步骤（由 FAggregator::Evaluate 处理）：<br>
+收集（Collection）：找出所有影响该属性的活动状态的 GameplayEffect 修改器。<br>
+分类（Categorization）：将修改器分为四类：Add（加）、Multiply（乘）、Divide（除）、Override（覆盖）。<br>
+
+**计算：**<br>
+- 将所有 Add 修改器相加，加到 BaseValue 上。<br>
+- 将所有 Multiply 修改器相加，再乘以之前的结果。<br>
+- 处理 Divide。<br>
+- 如果有 Override，则直接覆盖之前的所有结果。<br>
+
+```cpp
+struct FGameplayAttributeData
+{
+    // ...
+    float BaseValue;    // 基础值
+    float CurrentValue; // 聚合计算后的最终值
+};
+```
+
+当持续性 GE（Duration/Infinite）施加到角色身上时，<br>
+它们不会修改 BaseValue，而是被注册到该属性对应的 FAggregator 中。
+
+创建时机：根据源码中的 `OnAttributeAggregatorCreated` 虚函数可知，<br>
+只有当一个属性第一次受到持续性 GE 影响时，系统才会为它创建一个 Aggregator，以节省内存。<br>
+
+更新触发：每当 `Aggregator` 内部的修改器发生变化（Buff 到期、新 Buff 加入），<br>
+它会标记自己为“Dirty（脏）”，下次获取属性时就会重新计算并触发 `PreAttributeChange`。
+
+
+**核心特性：非破坏性修改**<br>
+Aggregator 最强大的地方在于它的非破坏性。<br>
+它永远保留着 BaseValue。<br>
+
+如果中了 10 个减速 Buff，Aggregator 只是在内存里把这 10 个修改器算了一遍。<br>
+当这 10 个 Buff 消失时，Aggregator 只要简单地停止计算它们，速度就会完美回退到初始状态，不需要手动去加回数值。<br>
+
+---
+
+
+
+
+---
 ### LyraGAS
 
 [抢先预告](https://dev.epicgames.com/documentation/zh-cn/unreal-engine/abilities-in-lyra-in-unreal-engine)
@@ -7519,7 +7759,7 @@ FGameplayAbilitySpecHandle GiveAbility(const FGameplayAbilitySpec& AbilitySpec);
 
 `AbilitySpec`有一个可选的Tag容器 : `DynamicAbilityTags`
 ```cpp
-struct GAMEPLAYABILITIES_API FGameplayAbilitySpec : public FFastArraySerializerItem
+struct FGameplayAbilitySpec : public FFastArraySerializerItem
 {
     /** Optional ability tags that are replicated.  These tags are also captured as source tags by applied gameplay effects. */
     UPROPERTY()
