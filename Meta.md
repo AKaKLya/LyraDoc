@@ -3108,9 +3108,9 @@ void DeleterFunc(void* Ptr)
 
 ---
 
-# 算法
 
-## ?
+
+## 算法
 
 ### Unique
 
@@ -3874,12 +3874,84 @@ void Copy(const InT& Input, OutT& Output)
 ---
 
 
+## 内存
+
+### TArray
+```cpp
+AMyActor* NewActor = GetWorld()->SpawnActor<AMyActor>(StaticClass());
+TArray<AMyActor*> MyActors;
+MyActors.Add(NewActor);
+AMyActor* First = MyActors[0];
+AMyActor** FirstActor = MyActors.GetData();
+
+TArray<int32> Nums;
+Nums.Add(10);
+int32 FirstNum = Nums[0];
+int32* FirstNumPtr = Nums.GetData();
+```
+
+`Add` 调用了这个函数:
+```cpp
+template <typename... ArgsType>
+SizeType Emplace(ArgsType&&... Args)
+{
+	const SizeType Index = AddUninitialized();
+	new(GetData() + Index) ElementType(Forward<ArgsType>(Args)...);
+	return Index;
+}
+```
+
+`AddUninitialized`: 让`ArrayNum`+1 ，`Num()` `IsEmpty()`等函数都是通过`ArrayNum`来判断的.<br>
+如果新的 `ArrayNum` 超过了当前容器的容量，那么就扩容.
+
+在内存分配器扩容之后，使用`首地址+Index`，在新的位置上构造元素 :
+```cpp
+new(GetData() + Index) ElementType(Forward<ArgsType>(Args)...);
+
+/* 用于返回指向第一个数组元素的类型化指针的辅助函数 */
+ElementType* GetData()
+{
+	return (ElementType*)AllocatorInstance.GetAllocation();
+}
+```
+
+`GetData()` 返回 `ElementType*`，`GetData() + Index` 实际计算出的内存地址为:<br>
+`GetData() 的地址 + Index * sizeof(ElementType)`
+
+![alt text](Meta/img1/TArray_Malloc.png)
+
+
+
+
+---
+
 
 # 引擎
+
+
+`Actor` 是引擎的重要类，先介绍它的前世今生.
+
+---
 
 ## Actor的反射
 
 ![alt text](Meta/img1/Construct_UClass.png)
+
+`.generated.h` `.gen.cpp`是反射的起源.
+
+`MyActor.gen.cpp` 的最后一行定义了一个Static的变量，<br>
+进入`WinMain`函数之前，这个变量的构造函数会把这个`MyActor`类注册到`ClassDefferredRegistry`.<br>
+进入`WinMain`函数之后，引擎读取`ClassDefferredRegistry`并构造里面存放的`UObject`类.
+
+构造过程包括注册蓝图可调用的C++函数，
+
+构造完成后，将这个`UObjectBase`添加到全局数组`GUObjectArray`中.
+
+之后，再次读取`ClassDeferredRegistry` 构造`UClass`的信息，这些信息包括`UProperty` `UFunction`.
+
+此时，`GUObjectArray` 和 `ClassDeferredRegistry` 存放的`UClass`都是`MyActor`的`StaticClass`.<br>
+在`UProperty`和`UFunction`的构造完成之后，要为这个`StaticClass`创造`CDO`对象.
+
 
 ---
 
@@ -4559,6 +4631,572 @@ AddResult AddRegistration(TType* (*InOuterRegister)(), TType* (*InInnerRegister)
 
 
 
+---
+
+## 垃圾回收
+
+![alt text](Meta/img1/GC.png)
+
+`UKismetSystemLibrary::CollectGarbage`:<br>
+删除所有未被引用的对象，只保留被引用的对象（此操作将被排队处理，并会在当前帧结束时执行）<br>
+注意：此操作可能较为耗时，且仅应在出现卡顿也能接受的情况下进行操作.
+```cpp
+UFUNCTION(BlueprintCallable, Category = "Utilities|Platform")
+static ENGINE_API void CollectGarbage()
+{
+    GEngine->ForceGarbageCollection(true);
+}
+
+void UEngine::ForceGarbageCollection(bool bForcePurge/*=false*/)
+{
+	TimeSinceLastPendingKillPurge = 1.0f + GetTimeBetweenGarbageCollectionPasses();
+	bFullPurgeTriggered = bFullPurgeTriggered || bForcePurge;
+}
+```
+
+`GEngine->ForceGarbageCollection`:<br>
+更新垃圾回收之间的计时器，以便在下次时机到来时能够启动垃圾回收操作。<br>
+`bFullPurgeTriggered`: 经过这个函数之后，它就是`true`,<br>
+意思是:是否已经触发了彻底的清理操作，使得下一次的“垃圾回收”无论何种情况都会进行彻底清理。
+
+`TimeSinceLastPendingKillPurge` 记录了 上一次GC到现在的间隔时长”。<br>
+`GetTimeBetweenGarbageCollectionPasses()` 返回当前GC之间的期望间隔时间（而非剩余时间）。<br>
+
+将其设置为 `1.0f + 间隔时间`，让引擎认为已经超过了预期的 GC 间隔，从而在下次检查时满足时间条件，允许执行 GC。
+
+```cpp
+static float GTimeBetweenPurgingPendingKillObjects = 60.0f;
+static FAutoConsoleVariableRef CVarTimeBetweenPurgingPendingKillObjects(
+	TEXT("gc.TimeBetweenPurgingPendingKillObjects"),
+	GTimeBetweenPurgingPendingKillObjects,
+	TEXT("Time in seconds (game time) we should wait between purging object references to objects that are pending kill."),
+	ECVF_Default
+);
+
+float UEngine::GetTimeBetweenGarbageCollectionPasses(bool bHasPlayersConnected) const
+{
+	float TimeBetweenGC = GTimeBetweenPurgingPendingKillObjects;
+    /* ... */
+	return TimeBetweenGC;
+}
+```
+
+`GTimeBetweenPurgingPendingKillObjects` 是一个全局变量，通过控制台可以修改这个值:
+```cpp
+gc.TimeBetweenPurgingPendingKillObjects 30
+```
+
+---
+
+Tick ?
+
+`TimeSinceLastPendingKillPurge` 让这个值大于超过期望值 就能让GC运行，GC如何知道运行时机？
+
+```cpp
+void UWorld::Tick( ELevelTick TickType, float DeltaSeconds )
+{
+    {
+		TRACE_CPUPROFILER_EVENT_SCOPE(ConditionalCollectGarbage);
+		GEngine->ConditionalCollectGarbage();
+	}
+}
+```
+
+通过`UWorld`每帧执行，当编辑器中有多个`World`时，会不会多次执行GC？
+```cpp
+uint64 GFrameCounter = 0;
+void UEngine::ConditionalCollectGarbage()
+{
+    if (GFrameCounter != LastGCFrame)
+    {
+        // ... 所有逻辑
+        LastGCFrame = GFrameCounter;
+    }
+}
+```
+使用 `GFrameCounter` 和 `LastGCFrame` 确保该函数在一帧内只执行一次，避免重复调用.<br>
+`GFrameCounter`是一个全局变量，每帧+1，主要由`FEngineLoop::Tick`这个函数来实现增加.
+
+
+`bFullPurgeTriggered` 是true，所以下面的代码会执行:
+```cpp
+void UEngine::ConditionalCollectGarbage()
+{
+    if (bFullPurgeTriggered)
+	{
+		if (TryCollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS, true))
+		{
+			ForEachObjectOfClass(UWorld::StaticClass(),[](UObject* World)
+			{
+				CastChecked<UWorld>(World)->CleanupActors();
+			});
+			bFullPurgeTriggered = false;
+			bShouldDelayGarbageCollect = false;
+			TimeSinceLastPendingKillPurge = 0.0f;
+		}
+	}
+    else
+    {
+        /* 根据时间间隔 自动触发增量清除 */
+    }
+}
+```
+
+先解释第一个分支，`bFullPurgeTriggered` :<br>
+`TryCollectGarbage`:只有在没有其他线程持有垃圾回收锁的情况下才执行垃圾回收操作.<br>
+`KeepFlags`: 具有这些标志的对象将无论是否被引用都会被保留.<br>
+`bPerformFullPurge`: 如果是`true`，则在标记过程结束后执行完整清理操作
+```cpp
+bool TryCollectGarbage(EObjectFlags KeepFlags, bool bPerformFullPurge)
+
+TryCollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS, true)
+```
+
+```cpp
+#define GARBAGE_COLLECTION_KEEPFLAGS (GIsEditor ? RF_Standalone : RF_NoFlags)
+```
+
+`RF_Standalone` : 即使对象未被引用，也要保留对象以供编辑.
+`RF_NoFlags`: 没有标志，用于避免类型转换.
+
+所以这里要清理没有标志的那些对象，在编辑器状态下 清理即使没有被引用 也要保留的那些对象.<br>
+之后执行完整清理操作.
+
+```cpp
+bool TryCollectGarbage(EObjectFlags KeepFlags, bool bPerformFullPurge)
+{
+    bool bCanRunGC = FGCCSyncObject::Get().TryGCLock();
+    /*...*/
+    if (bCanRunGC)
+	{ 
+		// Perform actual garbage collection
+		UE::GC::CollectGarbageInternal(KeepFlags, bPerformFullPurge);
+    }
+}
+```
+`TryGCLock`:先加锁，避免其他线程触发GC.
+
+```cpp
+void CollectGarbageInternal(EObjectFlags KeepFlags, bool bPerformFullPurge)
+{
+	const double StartTime = FPlatformTime::Seconds();
+
+	if (bPerformFullPurge)
+	{
+		CollectGarbageFull(KeepFlags);
+	}
+	else
+	{
+		CollectGarbageIncremental(KeepFlags);
+	}
+
+	GTimingInfo.LastGCDuration = FPlatformTime::Seconds() - StartTime;
+}
+```
+
+这里依旧是两条分支，由于前面传入的`bPerformFullPurge`是`true`，<br>
+所以走第一条分支， `else分支`是引擎因为时间到了 自动触发的GC.
+
+```cpp
+static void CollectGarbageFull(EObjectFlags KeepFlags)
+{
+    /*...*/
+	CollectGarbageImpl<true>(KeepFlags);
+}
+```
+
+还有模板参数？ 极致的优化.
+
+
+```cpp
+template<bool bPerformFullPurge>
+void CollectGarbageImpl(EObjectFlags KeepFlags)
+{
+    /*...*/
+
+    /* 锁定全局哈希表 */
+    FGCHashTableScopeLock GCHashTableLock;
+
+    const EGCOptions Options = 
+    (ShouldForceSingleThreadedGC() ? EGCOptions::None : EGCOptions::Parallel) |
+    (UObjectBaseUtility::IsPendingKillEnabled() ? EGCOptions::WithPendingKill : EGCOptions::None);
+
+    FRealtimeGC GC;
+    GC.PerformReachabilityAnalysis(KeepFlags, Options);
+}
+```
+
+根据当前环境决定 GC 选项：<br>
+如果强制单线程（如核心数少或控制台禁用并行），则使用 `EGCOptions::None`，<br>
+否则使用 `EGCOptions::Parallel`。
+如果 `PendingKill` 为`true`，则使用 `EGCOptions::WithPendingKill`。
+
+`bPendingKillDisabled` 如果是`true`，那么对象将永远不会被标记为 `PendingKill`，<br>
+因此对这些对象的引用也不会被垃圾回收器自动置空。
+```cpp
+static inline bool IsPendingKillEnabled()
+{
+	return !bPendingKillDisabled;
+}
+```
+`bPendingKillDisabled`默认是`false`，取反 返回`true`.
+
+`Options` 将会选择`EGCOptions::WithPendingKill`.
+
+---
+
+`PerformReachabilityAnalysis` : 执行可达性分析
+```cpp
+FRealtimeGC GC;
+GC.PerformReachabilityAnalysis(KeepFlags, Options);
+```
+
+`KeepFlags` : `RF_NoFlags`<br>
+`Options` : `WithPendingKill`<br>
+
+带有 `RF_NoFlags` 标志的对象无论是否被引用都会被保留下来。<br>
+
+```cpp
+void PerformReachabilityAnalysis(EObjectFlags KeepFlags, const EGCOptions Options)
+{
+    const EGCOptions OptionsForMarkPhase = Options & ~EGCOptions::WithPendingKill;
+
+	(this->*MarkObjectsFunctions[GetGCFunctionIndex(OptionsForMarkPhase)])(KeepFlags);
+}
+```
+
+`MarkObjectsFunctions` 一个存放函数的数组: <br>
+下面两个 `MarkObjectsAsUnreachable` 的区别在于 是否并行.为了 `在PS4上节省约6ms`.
+```cpp
+MarkObjectsFunctions[GetGCFunctionIndex(EGCOptions::None)] = &FRealtimeGC::MarkObjectsAsUnreachable<false>;
+
+MarkObjectsFunctions[GetGCFunctionIndex(EGCOptions::Parallel | EGCOptions::None)] = &FRealtimeGC::MarkObjectsAsUnreachable<true>;
+```
+
+这个函数里面有一个很长很长的`Lambda`函数.
+```cpp
+template <bool bParallel>
+void MarkObjectsAsUnreachable(const EObjectFlags KeepFlags)
+{
+    const int32 MaxNumberOfObjects = GUObjectArray.GetObjectArrayNum() - GUObjectArray.GetFirstGCIndex();
+	const int32 NumThreads = FMath::Max(1, FTaskGraphInterface::Get().GetNumWorkerThreads());
+	const int32 NumberOfObjectsPerThread = (MaxNumberOfObjects / NumThreads) + 1;		
+
+	TLockFreePointerListFIFO<FUObjectItem, PLATFORM_CACHE_LINE_SIZE> ClustersToDissolveList;
+	TLockFreePointerListFIFO<FUObjectItem, PLATFORM_CACHE_LINE_SIZE> KeepClusterRefsList;
+
+	TArray<TArray<UObject*>, TInlineAllocator<32>> ObjectsToSerializeArrays;
+	ObjectsToSerializeArrays.SetNum(NumThreads);
+
+    ParallelFor( TEXT("GC.MarkUnreachable"),NumThreads,1,/*Lambda*/
+    ,!bParallel ? EParallelForFlags::ForceSingleThread : EParallelForFlags::None);
+}
+```
+`ParallelFor`的第四个参数就是一个函数，在这里省略掉 写上的话就太长了，后面单独分析.
+
+
+这段代码中的第一个变量:
+```cpp
+const int32 MaxNumberOfObjects = GUObjectArray.GetObjectArrayNum() - GUObjectArray.GetFirstGCIndex();
+```
+`GUObjectArray` 中存在一部分永远不会被垃圾回收的对象，这些对象属于永久对象池 `disregard for GC`.<br>
+为了提高 `GC` 性能，遍历时跳过这些对象，只处理可能被回收的那部分对象。
+
+
+`ParallelFor` 中的 `Lambda` : <br>
+下面的某些变量在上面的代码里可以找到，因为这个`Lambda`会捕获这些变量，变量名称都是一样的.
+```cpp
+int32 FirstObjectIndex = ThreadIndex * NumberOfObjectsPerThread + GUObjectArray.GetFirstGCIndex();
+int32 LastObjectIndex = FMath::Min(GUObjectArray.GetObjectArrayNum() - 1, FirstObjectIndex + NumObjects - 1);
+TArray<UObject*>& LocalObjectsToSerialize = ObjectsToSerializeArrays[ThreadIndex];
+
+for (int32 ObjectIndex = FirstObjectIndex; ObjectIndex <= LastObjectIndex; ++ObjectIndex)
+{
+    FUObjectItem* ObjectItem = &GUObjectArray.GetObjectItemArrayUnsafe()[ObjectIndex];
+    if (ObjectItem->Object)
+    {
+        UObject* Object = (UObject*)ObjectItem->Object;
+
+        ObjectCountDuringMarkPhase++;
+        ObjectItem->ClearFlags(EInternalObjectFlags::ReachableInCluster);
+    }
+}
+```
+在`if`里面 更新对象计数，清除 `ReachableInCluster` 标志<br>
+之后，根据对象类型和标志决定是否标记为不可达: 因为这一段很长，先解释思路 <br>
+对象分为三类：<br>
+根集对象 - `IsRootSet()`
+- 直接加入 `LocalObjectsToSerialize`。
+- 如果是集群根或属于某个集群，则同时加入 KeepClusterRefsList。
+
+集群对象 - `GetOwnerIndex() > 0`
+- 如果持有 `FastKeepFlags（GarbageCollectionKeepFlags）`，则加入 `LocalObjectsToSerialize` 和 `KeepClusterRefsList`。
+- 否则，这类对象不会在标记阶段被单独处理（其可达性由集群根决定）。
+
+普通对象或集群根 - `GetOwnerIndex() <= 0`
+- 初始认为应该标记为不可达 `bMarkAsUnreachable = true`。
+- 如果对象持有 `FastKeepFlags`（包括根集标志），则取消标记。
+- 如果 `KeepFlags != RF_NoFlags` 且对象持有任何 `KeepFlags`，则取消标记。
+- 如果对象是 `PendingKill` 或 `Garbage` 且是集群根，则将其加入 `ClustersToDissolveList`（稍后溶解集群）。
+
+若最终 `bMarkAsUnreachable` 为真，则设置 `EInternalObjectFlags::Unreachable`<br>
+否则加入 `LocalObjectsToSerialize`，如果是集群根则加入 `KeepClusterRefsList`。
+
+```cpp
+if (ObjectItem->IsRootSet())
+{
+    LocalObjectsToSerialize.Add(Object);
+}
+else if (ObjectItem->GetOwnerIndex() > 0)
+{
+
+}
+// Regular objects or cluster root objects
+else
+{
+    bool bMarkAsUnreachable = true;
+	// 内部标志的检查速度非常快，供异步加载使用，优先级必须高于PendingKill
+	if (ObjectItem->HasAnyFlags(FastKeepFlags))
+	{
+		bMarkAsUnreachable = false;
+	}
+    else if (!ObjectItem->IsPendingKill() && KeepFlags != RF_NoFlags && Object->HasAnyFlags(KeepFlags))
+	{
+		bMarkAsUnreachable = false;
+	}
+}
+```
+
+`FastKeepFlags` : Native | Async | AsyncLoading | LoaderImport <br>
+`Native` : 只有`UClass`是`Native`.<br>
+`Async` : 对象只存在于与游戏线程不同的线程中.<br>
+`AsyncLoading` : 对象正在异步加载.<br>
+`LoaderImport` : 对象可以在加载期间被另一个包导入.
+
+如果没有`FastKeepFlags`这些标记，就检查`IsPendingKill`.<br>
+如果不是`IsPendingKill`的对象，那么标记为`可到达`.
+
+反过来说，如果是`PendingKill`的对象，它就会被标记为`不可达`.
+
+经过检测后，如果是 `不可达` 的对象，就对它设置`Unreachable`的Flag:
+```cpp
+if (!bMarkAsUnreachable)
+{
+	LocalObjectsToSerialize.Add(Object);
+}
+else
+{
+	ObjectItem->SetFlags(EInternalObjectFlags::Unreachable);
+}
+```
+注意，这里设置的是`ObjectItem`， 它是 `GUObjectArray` 里面的对象，<br>
+真正的`UObject`对象是`ObjectItem->Object`.
+
+如此一来，`GUObjectArray`里面的某些对象就被标记为了 `Unreachable`.
+
+而对于那些 `可到达` 的对象，它们会被添加到`LocalObjectsToSerialize`.
+
+---
+
+`LocalObjectsToSerialize` 是这个`Lambda`函数从外面捕获的，<br>
+真身是 `ObjectsToSerializeArrays`:
+```cpp
+TArray<TArray<UObject*>, TInlineAllocator<32>> ObjectsToSerializeArrays;
+ObjectsToSerializeArrays.SetNum(NumThreads);
+
+ParallelFor(TEXT("GC.MarkUnreachable"),NumThreads,1,
+[&ObjectsToSerializeArrays]()
+{
+    TArray<UObject*>& LocalObjectsToSerialize = ObjectsToSerializeArrays[ThreadIndex];
+})
+```
+
+遍历完要检测GC的对象后，那些 `可到达` 的对象就被存放在`ObjectsToSerializeArrays`之中.<br>
+
+最终合并到 `InitialObjects` 数组中，作为后续可达性遍历的种子（即从这些对象出发，继续遍历其引用的对象）:
+```cpp
+for (TArray<UObject*>& Objects : ObjectsToSerializeArrays)
+{
+	InitialObjects.Append(Objects);
+}
+```
+
+---
+
+回到这里：
+
+![alt text](Meta/img1/Reachability_Main.png)
+
+```cpp
+FContextPoolScope Pool;
+FWorkerContext* Context = Pool.AllocateFromPool();
+Context->InitialNativeReferences = GetInitialReferences(Options);
+Context->SetInitialObjectsUnpadded(InitialObjects);
+PerformReachabilityAnalysisOnObjects(Context, Options);
+```
+参数 `Context` 携带了 `InitialObjects` ，里面存放的就是前面找到的那些 `可到达` 的对象.
+
+之后来到这个函数:
+```cpp
+template <EGCOptions Options>
+void PerformReachabilityAnalysisOnObjectsInternal(FWorkerContext& Context)
+{
+    TReachabilityProcessor<Options> Processor;
+	CollectReferences<TReachabilityCollector<Options>>(Processor, Context);
+}
+```
+
+模板参数`Options` 是 `EGCOptions::Parallel | EGCOptions::WithPendingKill`.
+
+最终到了这个函数: `TFastReferenceCollector::ProcessObjectArray` <br>
+`EGCOptions::Parallel` 只是要并行执行这个函数.
+```cpp
+void ProcessObjectArray(FWorkerContext& Context)
+{
+    /*...*/
+}
+```
+`ProcessObjectArray` 做的事情是:遍历 `可到达` 的这些对象，清除它们引用的对象的 `不可达` 标签.
+
+
+---
+
+
+## 弱指针
+
+上一节 `垃圾回收` 流程图的左上角部分， 有以下代码:
+```cpp
+bool UObject::ConditionalFinishDestroy()
+{
+    FinishDestroy();
+
+	// Make sure this object can't be accessed via weak pointers after it's been FinishDestroyed
+	GUObjectArray.ResetSerialNumber(this);
+
+	// Make sure this object can't be found through any delete listeners (annotation maps etc) after it's been FinishDestroyed
+	GUObjectArray.RemoveObjectFromDeleteListeners(this);
+}
+```
+一个 `UObject` 被回收以后还要禁止弱指针对它的访问:
+```
+Make sure this object can't be accessed via weak pointers after it's been FinishDestroyed
+```
+
+弱指针和 `GUObjectArray` 的关系是？？？
+
+---
+
+
+弱指针在创建或被设置时，会指向一个已实例化的现有 `UObject`，并通过其在 `GUObjectArray` 中的索引进行定位.<br>
+该指针无需被标记为 `UPROPERTY`，也能够判断其所指向的对象是否已被垃圾回收.
+
+---
+
+```cpp
+template<class T=UObject, class TWeakObjectPtrBase=FWeakObjectPtr>
+struct TWeakObjectPtr;
+
+/*-----*/
+
+template<class T, class TWeakObjectPtrBase>
+struct TWeakObjectPtr : private TWeakObjectPtrBase
+{
+    /**  
+	 * Copy from an object pointer
+	 * @param Object object to create a weak pointer to
+	 */
+	template<class U>
+	typename TEnableIf<!TLosesQualifiersFromTo<U, T>::Value, TWeakObjectPtr&>::Type operator=(U* Object)
+	{
+		T* TempObject = Object;
+		TWeakObjectPtrBase::operator=(TempObject);
+		return *this;
+	}
+}
+```
+`operator=` 转发给了父类的`operator=` ,<br>
+`TWeakObjectPtr`的父类是`FWeakObjectPtr`,<br>
+以下是`FWeakObjectPtr`的相关函数 :
+```cpp
+void FWeakObjectPtr::operator=(const class UObject *Object)
+{
+	if (Object)
+	{
+		ObjectIndex = GUObjectArray.ObjectToIndex((UObjectBase*)Object);
+		ObjectSerialNumber = GUObjectArray.AllocateSerialNumber(ObjectIndex);
+		checkSlow(SerialNumbersMatch());
+	}
+	else
+	{
+		Reset();
+	}
+}
+
+/**
+* Reset the weak pointer back to the null state
+*/
+void FWeakObjectPtr::Reset()
+{
+	using namespace UE::Core::Private;
+
+	ObjectIndex = InvalidWeakObjectIndex;
+	ObjectSerialNumber = 0;
+}
+```
+
+通过一个 `UObject` 设置弱指针时，弱指针会去`GUObjectArray`里面找到这个`UObject`的索引，并申请一个序列号.<br>
+`AllocateSerialNumber` 使用原子操作递增序列号并返回，线程安全.
+
+所以 弱指针只存了 `ObjectIndex` 和 `ObjectSerialNumber`.
+
+---
+
+`Set` 知道了，那么 `Get` 呢？
+
+```cpp
+T* Get() const
+{
+	return (T*)TWeakObjectPtrBase::Get();
+}
+
+UObject* FWeakObjectPtr::Get() const
+{
+	// Using a literal here allows the optimizer to remove branches later down the chain.
+	return Internal_Get(false);
+}
+
+UObject* Internal_Get(bool bEvenIfPendingKill) const
+{
+	FUObjectItem* const ObjectItem = Internal_GetObjectItem();
+	return ((ObjectItem != nullptr) && GUObjectArray.IsValid(ObjectItem, bEvenIfPendingKill)) ? (UObject*)ObjectItem->Object : nullptr;
+}
+
+FUObjectItem* Internal_GetObjectItem() const
+{
+	using namespace UE::Core::Private;
+
+	if (ObjectSerialNumber == 0)
+	{return nullptr;}
+
+	if (ObjectIndex < 0)
+	{return nullptr;}
+
+	FUObjectItem* const ObjectItem = GUObjectArray.IndexToObject(ObjectIndex);
+
+	if (!ObjectItem)
+	{return nullptr;}
+
+	if (!SerialNumbersMatch(ObjectItem))
+	{return nullptr;}
+	return ObjectItem;
+}
+```
+
+`Internal_GetObjectItem` : <br>
+通过 `ObjectIndex` 到全局数组中获得`ObjectItem`，然后对比`ObjectSerialNumber`是否匹配，<br>
+如果匹配成功，就说明这个弱指针保存的对象有效.
+
+所以 弱指针保存的是 `UObject` 在全局数组中的索引.
 
 
 ---
@@ -4566,9 +5204,22 @@ AddResult AddRegistration(TType* (*InOuterRegister)(), TType* (*InInnerRegister)
 
 ## Actor操作
 
+
+### 都市传说之Cast To
+
+![alt text](Meta/img1/Cast.png)
+
+---
+
 ### SpawnActor
 
 ![alt text](Meta/img1/SpawnActor.png)
+
+图中最右侧的 `UObjectBase::AddObject` 函数 ，将这个 `UObject` 存入了哈希表中.<br>
+这将在后来的 `TActorIterator` 中有使用到，<br>
+而 `GetActorOfClass` 使用 `TActorIterator` 实现.
+
+---
 
 ```cpp
 AActor* UWorld::SpawnActor( UClass* Class, FTransform const* UserTransformPtr, const FActorSpawnParameters& SpawnParameters )
@@ -4845,7 +5496,8 @@ UObject* StaticConstructObject_Internal(const FStaticConstructObjectParameters& 
 ```cpp
 FObjectInitializer::FObjectInitializer(UObject* InObj, 
 const FStaticConstructObjectParameters& StaticConstructParams)
-: Obj(InObj), ObjectArchetype(StaticConstructParams.Template),
+: Obj(InObj)
+, ObjectArchetype(StaticConstructParams.Template),
 bShouldInitializePropsFromArchetype(true)
 ```
 
@@ -5024,69 +5676,77 @@ AActor* UWorld::SpawnActor( UClass* Class, FTransform const* UserTransformPtr, c
 ---
 
 关于`SpawnActor`的第三个参数:`FActorSpawnParameters`.
+```
+Name
+要分配给生成 Actor 的名称。若未指定，将自动生成为 [类名]_[数字] 的形式。
 
-**Name**<br>
-要分配给生成 Actor 的名称。若未指定，将自动生成为 [类名]_[数字] 的形式。<br>
+Template
+用作模板的 Actor，新 Actor 将使用该模板的属性值进行初始化。若为 NULL，则使用类的默认对象（CDO）。
 
-**Template**<br>
-用作模板的 Actor，新 Actor 将使用该模板的属性值进行初始化。若为 NULL，则使用类的默认对象（CDO）。<br>
+Owner
+生成此 Actor 的拥有者（可为 NULL）。
 
-**Owner**<br>
-生成此 Actor 的拥有者（可为 NULL）。<br>
+Instigator
+负责由生成 Actor 造成伤害的 Pawn（可为 NULL）。
 
-**Instigator**<br>
-负责由生成 Actor 造成伤害的 Pawn（可为 NULL）。<br>
+OverrideLevel
+指定 Actor 所在的关卡（即 Actor 的 Outer）。若为 NULL，则使用 Owner 的 Outer；若 Owner 也为 NULL，则使用持久关卡。
 
-**OverrideLevel**<br>
-指定 Actor 所在的关卡（即 Actor 的 Outer）。若为 NULL，则使用 Owner 的 Outer；若 Owner 也为 NULL，则使用持久关卡。<br>
+OverridePackage（仅编辑器）
+设置 Actor 所在的包。若为 NULL，Actor 将与持久关卡保存在同一包中。
 
-**OverridePackage**（仅编辑器）<br>
-设置 Actor 所在的包。若为 NULL，Actor 将与持久关卡保存在同一包中。<br>
+OverrideActorGuid（仅编辑器）
+为 Actor 设置的 GUID。通常仅在重实例化蓝图 Actor 时使用。
 
-**OverrideActorGuid**（仅编辑器）<br>
-为 Actor 设置的 GUID。通常仅在重实例化蓝图 Actor 时使用。<br>
+OverrideParentComponent
+设置 Actor 的父组件。
 
-**OverrideParentComponent**<br>
-设置 Actor 的父组件。<br>
+SpawnCollisionHandlingOverride
+指定生成点碰撞的处理方式。Undefined 表示不覆盖，使用 Actor 自身的设置。
 
-**SpawnCollisionHandlingOverride**<br>
-指定生成点碰撞的处理方式。Undefined 表示不覆盖，使用 Actor 自身的设置。<br>
+TransformScaleMethod
+决定生成的变换是乘以根组件的缩放，还是覆盖根组件的缩放。
 
-**TransformScaleMethod**<br>
-决定生成的变换是乘以根组件的缩放，还是覆盖根组件的缩放。<br>
+bRemoteOwned（私有，通过 IsRemoteOwned() 访问）
+表示 Actor 是否为远程拥有。应仅由包映射在客户端创建从服务器复制的 Actor 时设置。
 
-**bRemoteOwned**（私有，通过 IsRemoteOwned() 访问）<br>
-表示 Actor 是否为远程拥有。应仅由包映射在客户端创建从服务器复制的 Actor 时设置。<br>
+bNoFail
+若为 true，即使某些条件（如类为 bStatic 或模板类与生成类不匹配）不满足，生成也不会失败。
 
-**bNoFail**<br>
-若为 true，即使某些条件（如类为 bStatic 或模板类与生成类不匹配）不满足，生成也不会失败。<br>
+bDeferConstruction
+若为 true，则不会在生成的 Actor 上运行构造脚本。仅适用于从蓝图生成的 Actor。
 
-**bDeferConstruction**<br>
-若为 true，则不会在生成的 Actor 上运行构造脚本。仅适用于从蓝图生成的 Actor。<br>
+bAllowDuringConstructionScript
+若为 false，则在运行构造脚本时生成 Actor 将失败。
 
-**bAllowDuringConstructionScript**<br>
-若为 false，则在运行构造脚本时生成 Actor 将失败。<br>
+bForceGloballyUniqueName（非编辑器）
+强制生成的 Actor 使用全局唯一名称（此时提供的名称应为 None）。
 
-**bForceGloballyUniqueName**（非编辑器）<br>
-强制生成的 Actor 使用全局唯一名称（此时提供的名称应为 None）。<br>
+bTemporaryEditorActor（仅编辑器）
+确定在编辑器中是否在生成的 Actor 上运行开始播放周期。
 
-**bTemporaryEditorActor**（仅编辑器）<br>
-确定在编辑器中是否在生成的 Actor 上运行开始播放周期。<br>
+bHideFromSceneOutliner（仅编辑器）
+确定是否应从场景大纲中隐藏该 Actor。
 
-**bHideFromSceneOutliner**（仅编辑器）<br>
-确定是否应从场景大纲中隐藏该 Actor。<br>
+bCreateActorPackage（仅编辑器）
+若关卡支持，是否为该 Actor 创建新的包。
 
-**bCreateActorPackage**（仅编辑器）<br>
-若关卡支持，是否为该 Actor 创建新的包。<br>
+NameMode
+指定当提供的名称非 None 时，SpawnActor 处理该名称的方式（例如：若名称已占用，是报错、返回空还是自动生成新名称）。
 
-**NameMode**<br>
-指定当提供的名称非 None 时，SpawnActor 处理该名称的方式（例如：若名称已占用，是报错、返回空还是自动生成新名称）。<br>
+ObjectFlags
+用于描述生成的 Actor/对象实例的对象标志（如 RF_Transactional 等）。
 
-**ObjectFlags**<br>
-用于描述生成的 Actor/对象实例的对象标志（如 RF_Transactional 等）。<br>
+CustomPreSpawnInitalization
+自定义函数，允许调用者在 Actor 构造完成后、但其他系统感知到该 Actor 生成之前执行特定逻辑。
+```
 
-**CustomPreSpawnInitalization**<br>
-自定义函数，允许调用者在 Actor 构造完成后、但其他系统感知到该 Actor 生成之前执行特定逻辑。<br>
+---
+
+
+### CDO的组件
+
+
 
 ---
 
@@ -5397,7 +6057,7 @@ UObject* StaticAllocateObject()
 	new ((void *)Obj) UObjectBase(const_cast<UClass*>(InClass), InFlags|RF_NeedInitialization, InternalSetFlags, InOuter, InName, OldIndex, OldSerialNumber);
 }
 ```
-`new UObjectBase` 的构造函数 向`GUObjectArray`注册了自己.
+`new UObjectBase` 的构造函数 向`GUObjectArray`注册了自己 - `AddObject`.
 ```cpp
 UObjectBase::UObjectBase()
 {
@@ -5451,24 +6111,22 @@ void FUObjectArray::AllocateUObjectIndex(UObjectBase* Object, EInternalObjectFla
 
 ## 反射操作
 
+
+
 ### ClassName
 
 ```cpp
 UMyClass* MyClass = NewObject<UMyClass>();
 UClass* Class = MyClass->GetClass();
-FName ClassName = Class->GetFName();
-```
-`NewObject` :
-```cpp
-UMyClass* NewObject(UObject* Outer = (UObject*)GetTransientPackage())
-{
-    FStaticConstructObjectParameters Params(UMyClass::StaticClass());
-	Params.Outer = Outer;
-	return static_cast<UMyClass*>(StaticConstructObject_Internal(Params));
-}
+FString ClassName = Class->GetName();
+
+/* 或者 */
+UE_LOG(LogTemp, Warning, TEXT("UClass Name: %s"), *UMyClass::StaticClass()->GetName());
 ```
 
-`Params.Class = UMyClass::StaticClass()`
+名称的来历:
+
+`Params.Class = UMyClass::StaticClass()` 调用的是 `GetPrivateStaticClass` 函数.
 
 ```cpp
 UCLASS()
@@ -5483,7 +6141,11 @@ public:
 		return GetPrivateStaticClass(); 
 	}
 };
+```
 
+在`.gen.cpp`中 声明:`IMPLEMENT_CLASS_NO_AUTO_REGISTRATION(UMyClass);`<br>
+宏展开的结果:
+```cpp
 FClassRegistrationInfo Z_Registration_Info_UClass_UMyClass
 UClass* UMyClass::GetPrivateStaticClass() 
 { 
@@ -5492,42 +6154,5096 @@ UClass* UMyClass::GetPrivateStaticClass()
 		GetPrivateStaticClassBody(
 		StaticPackage(), 
 		(TCHAR*)TEXT(UMyClass) + 1 + ((StaticClassFlags & CLASS_Deprecated) ? 11 : 0), 
-		Z_Registration_Info_UClass_UMyClass.InnerSingleton, 
-		StaticRegisterNativesUMyClass,
-		sizeof(UMyClass), 
-		alignof(UMyClass), 
-		UMyClass::StaticClassFlags, 
-		UMyClass::StaticClassCastFlags(), 
-		UMyClass::StaticConfigName(), 
-		(UClass::ClassConstructorType)InternalConstructor<UMyClass>, 
-		(UClass::ClassVTableHelperCtorCallerType)InternalVTableHelperCtorCaller<UMyClass>, 
-		UOBJECT_CPPCLASS_STATICFUNCTIONS_FORCLASS(UMyClass), 
-		&UMyClass::Super::StaticClass, 
-		&UMyClass::WithinClass::StaticClass 
+		/*...*/
 		); 
 	} 
 	return Z_Registration_Info_UClass_UMyClass.InnerSingleton; 
 }
 ```
 
+真正的名称在这里定义:
+```cpp
+(TCHAR*)TEXT(UMyClass) + 1 + ((StaticClassFlags & CLASS_Deprecated) ? 11 : 0), 
+```
+`+ 1`：指针偏移1.<br>
+字符串 "UMyClass" 的首地址加 1，就变成了从第二个字符开始，即 `MyClass`.
+
+`+ ((StaticClassFlags & CLASS_Deprecated) ? 11 : 0)`:<br>
+如果一个类被标记为 `CLASS_Deprecated`，<br>
+编译器在生成代码时，可能会在类名前面加上特殊的标记字符串,通常是 `Deprecated_`。<br>
+如果类被废弃了，偏移量再增加 `11`，从而跳过这个前缀，确保拿到的依然是类本身的原始名称。
+
+
+---
+
+### Property
+
+类定义：
+```cpp
+UCLASS()
+class UMyClass : public UObject
+{
+	GENERATED_BODY()
+	
+public:
+	UPROPERTY()
+	FString MyStr{"ZZXX"};
+};
+
+
+UCLASS()
+class UMyClassD : public UMyClass
+{
+	GENERATED_BODY()
+	
+public:
+	UPROPERTY()
+	FString MyStrD{"ZZXX_D"};
+};
+```
+
+测试示例：
+
+```cpp
+void AMyActor::RefInfo()
+{
+	UMyClass* MyClass = NewObject<UMyClassD>();
+	UClass* ClassType = MyClass->GetClass();
+
+	for (FProperty* Property = ClassType->PropertyLink; Property; Property = Property->PropertyLinkNext)
+	{
+		FString PropertyName = Property->GetName();
+		FString PropertyType = Property->GetCPPType();
+		UE_LOG(LogTemp, Warning, TEXT("Property Name: %s,Type:%s"), *PropertyName,*PropertyType);
+		
+		if (PropertyType == "FString")
+		{
+			FStrProperty* StringProperty = CastField<FStrProperty>(Property);
+			void* Addr = StringProperty->ContainerPtrToValuePtr<void>(MyClass);
+			FString PropertyValue = StringProperty->GetPropertyValue(Addr);
+			
+			UE_LOG(LogTemp, Warning, TEXT("Property Name: %s,Type:%s, Property Value: %s"), *PropertyName,*PropertyType,*PropertyValue);
+
+            StringProperty->SetPropertyValue(Addr,"ZZ");
+		}
+	}
+}
+```
+
+
+输出结果:
+```cpp
+LogTemp: Warning: UClass Name: MyClass
+LogTemp: Warning: Property Name: MyStrD,Type:FString
+LogTemp: Warning: Property Name: MyStrD,Type:FString, Property Value: ZZXX_D
+LogTemp: Warning: Property Name: MyStr,Type:FString
+LogTemp: Warning: Property Name: MyStr,Type:FString, Property Value: ZZXX
+```
+
+---
+
+属性来历:
+
+![alt text](Meta/img1/Construct_UClass.png)
+
+
+左上角`UClass`部分，`ConstructUClass`这个函数构建`UClass` 并 链接属性和函数.
+
+`ConstructFProperties` 构造了属性，并将这个`UClass`设置为属性的`Outer`.<br>
+将这些属性对象通过 `Next` 指针串联起来，<br>
+最后，`FProperty::Init` 将属性设置为 `NewClass` 的 `ChildProperties`.
+
+之后调用`NewClass->StaticLink()`<br>
+`UStruct::Link`：去扫描 `ChildProperties` ，结合父类的属性，最终链接成 `PropertyLink` 快速访问链表。
+
+`UStruct::Link`:
+```cpp
+FProperty** PropertyLinkPtr = &PropertyLink;
+FProperty** RefLinkPtr = (FProperty**)&RefLink;
+
+for (TFieldIterator<FProperty> It(this); It; ++It)
+{
+    FProperty* Property = *It;
+
+    // A. 所有的属性都连进 PropertyLink
+    *PropertyLinkPtr = Property;
+    PropertyLinkPtr = &(*PropertyLinkPtr)->PropertyLinkNext;
+
+    // B. 如果属性包含 UObject 引用，连进 RefLink
+    // 这样 GC 扫描时只需要走这条链，不用看 int/bool 等非对象属性
+    if (Property->ContainsObjectReference(EncounteredStructProps, EPropertyObjectReferenceType::Any))
+    {
+        *RefLinkPtr = Property;
+        RefLinkPtr = &(*RefLinkPtr)->NextRef;
+    }
+}
+// 链表收尾
+*PropertyLinkPtr = nullptr;
+*RefLinkPtr = nullptr;
+
+// 收集所有属性引用的 UObject，存入 ScriptAndPropertyObjectReferences
+// 这是为了让 GC 能识别出该类定义中所引用的静态对象（如默认值里的资源）
+CollectPropertyReferencedObjects(MutableView(ScriptAndPropertyObjectReferences));
+```
+
+---
+
+
+### Function
+
+类定义
+```cpp
+UCLASS()
+class UMyClass : public UObject
+{
+	GENERATED_BODY()
+	
+public:
+	UPROPERTY()
+	FString MyStr{"ZZXX"};
+	
+	UFUNCTION()
+	void HelloWorld()
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Hello World!"));
+	}
+};
+
+
+UCLASS()
+class UMyClassD : public UMyClass
+{
+	GENERATED_BODY()
+	
+public:
+	UPROPERTY()
+	FString MyStrD{"ZZXX_D"};
+	
+	UFUNCTION()
+	int32 HelloWorldD()
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Hello World! D"));
+		return 3;
+	}
+};
+```
+
+测试示例：
+
+```cpp
+for (TFieldIterator<UFunction> It(ClassType); It; ++It)
+{
+	UFunction* Func = *It;
+	UE_LOG(LogTemp, Warning, TEXT("Function Name: %s"), *Func->GetName());
+        
+	// 可以查看函数的标记，比如是不是蓝图定义的
+	if (Func->HasAnyFunctionFlags(FUNC_BlueprintEvent))
+	{
+		UE_LOG(LogTemp, Log, TEXT("  - This is a Blueprint Event"));
+	}
+}
+```
+
+
+```cpp
+LogTemp: Warning: Function Name: HelloWorldD
+LogTemp: Warning: Function Name: HelloWorld
+```
+
+---
+
+## 委托
+
+### 说明文档
+
+翻译自源文件的注释.
+
+本系统允许以通用且类型安全的方式调用 C++ 对象的成员函数。<br>
+使用委托，可以动态绑定到任意对象的成员函数，然后在该对象上调用函数，即使调用者不知道对象的类型。<br>
+系统预定义了各种通用函数签名的组合，您可以从中声明委托类型，<br>
+根据需要的类型填写返回值和参数的类型名。<br>
+
+支持单播委托和多播委托，以及“动态”委托，<br>
+动态委托可以序列化到磁盘并从蓝图中访问。<br>
+
+此外，委托可以定义“载荷”数据，这些数据将被存储并直接传递给绑定的函数。<br>
+
+目前支持使用以下任意组合的委托签名：
+- 有返回值的函数
+- 最多四个“载荷”变量
+- 取决于宏/模板声明的多个函数参数
+- 声明为 'const' 的函数
+
+也支持多播委托，使用 `DECLARE_MULTICAST_DELEGATE...` 宏。
+- 多播委托允许附加多个函数委托，然后通过调用单个 `Broadcast()` 函数一次性全部执行。
+- 多播委托签名不允许使用返回值。
+
+
+与其他类型不同，`动态委托`集成在 `UObject` 反射系统中，可以绑定到蓝图实现的函数或序列化到磁盘。<br>
+也可以绑定本地函数，但本地函数需要使用 `UFUNCTION` 宏声明。<br>
+绑定到其他类型委托的函数则不需要使用 `UFUNCTION`。<br>
+ 
+您可以为委托分配“载荷数据”！这些是任意的变量，当委托被调用时，<br>
+它们将直接传递给任何绑定的函数。这非常有用，因为它允许您在绑定时<br>
+就将参数存储在委托内部。除了“动态”委托外，所有委托类型都自动支持载荷变量！<br>
+ 
+绑定到委托时，可以传递载荷数据。<br>
+此示例传递了两个自定义变量:<br>
+一个 `bool` 和一个 `int32` 给委托。<br>
+然后当委托被调用时，这些参数将传递给被绑定的函数。<br>
+
+**额外的变量参数必须始终放在委托类型参数之后** <br>
+ 
+`MyDelegate.BindStatic( &MyFunction, true, 20 );`
+ 
+请记住查看此文档注释底部的签名表，了解要使用的宏名称以及绑定表，了解绑定的选项和注意事项。
 
 
 
+委托系统理解某些类型的对象，当使用这些对象时，会启用附加功能。<br>
+如果将委托绑定到 `UObject` 或共享指针类的成员，委托系统可以保持对该对象的弱引用，<br>
+这样如果对象在委托下方被销毁，可以通过调用 `IsBound()` 或 `ExecuteIfBound()` 函数来处理这些情况。<br>
+
+复制委托对象是完全安全的，委托可以按值传递，但通常不推荐这样做，<br>
+因为它们确实需要在堆上分配内存，尽可能通过引用传递它们！<br>
+委托签名声明可以存在于全局作用域、命名空间内，甚至类声明内（但不能在函数体内）。
+
+
+```cpp
+BindStatic(&GlobalFunctionName)						
+BindUObject(UObject, &UClass::Function)				
+BindSP(SharedPtr, &FClass::Function)				
+BindThreadSafeSP(SharedPtr, &FClass::Function)		
+BindRaw(RawPtr, &FClass::Function)					
+BindLambda(Lambda)									
+BindSPLambda(SharedPtr, Lambda)						
+BindWeakLambda(UObject, Lambda)						
+BindUFunction(UObject, FName("FunctionName"))		
+BindDynamic(UObject, &UClass::FunctionName)			
+```
+
+` BindStatic`:  调用静态函数，可以是全局作用域的，也可以是类静态的<br>
+` BindUObject`: 通过 `TWeakObjectPtr` 调用 `UObject` 类成员函数，如果对象无效则不会被调用<br>
+` BindSP`:  通过 `TWeakPtr` 调用本地类成员函数，如果共享指针无效则不会被调用<br>
+` BindThreadSafeSP`:    通过 `TWeakPtr` 调用本地类成员函数，如果共享指针无效则不会被调用<br>
+
+` BindRaw`:     调用本地类成员函数，不进行安全检查。对象销毁时，必须调用 `Unbind` 或 `Remove` 以避免崩溃！<br>
+` BindLambda`:      调用 `lambda` 函数，不进行安全检查。您必须确保所有捕获在以后都是安全的，以避免崩溃！<br>
+` BindSPLambda`:        仅在共享指针仍然有效时调用 `lambda` 函数。捕获的 `this` 将始终有效，但任何其他捕获可能无效<br>
+` BindWeakLambda`:      仅在 `UObject` 仍然有效时调用 `lambda` 函数。捕获的 `this` 将始终有效，但任何其他捕获可能无效<br>
+
+` BindUFunction`:       适用于本地和动态委托，将调用指定名称的 `UFUNCTION`<br>
+` BindDynamic`:     仅适用于动态委托的便捷包装器，`FunctionName` 必须声明为 `UFUNCTION`<br>
+
+
+---
+
+### 类分析
+```cpp
+DECLARE_DELEGATE(FOnTest)
+```
+使用宏展开的结果:
+```cpp
+using FOnTest = TDelegate<void()>;
+```
+
+TDelegate ?
+
+```cpp
+template <typename DelegateSignature, typename UserPolicy = FDefaultDelegateUserPolicy>
+class TDelegate
+{
+	static_assert(sizeof(UserPolicy) == 0, "Expected a function signature for the delegate template parameter");
+};
+
+template <typename InRetValType, typename... ParamTypes, typename UserPolicy>
+class TDelegate<InRetValType(ParamTypes...), UserPolicy> : public UserPolicy::FDelegateExtras
+```
+
+主模板定义了默认参数，`UserPolicy = FDefaultDelegateUserPolicy `<br>
+第二个模板在实例化时 使用主模板的`UserPolicy`默认参数.
+
+```cpp
+struct FDefaultDelegateUserPolicy
+{
+	using FDelegateInstanceExtras = IDelegateInstance;
+	using FThreadSafetyMode =FNotThreadSafeDelegateMode;
+	using FDelegateExtras = TDelegateBase<FThreadSafetyMode>;
+	using FMulticastDelegateExtras = TMulticastDelegateBase<FDefaultDelegateUserPolicy>;
+};
+```
+所以第二个模板的 `UserPolicy::FDelegateExtras` <br>
+是`using FDelegateExtras = TDelegateBase<FThreadSafetyMode>;`<br>
+```cpp
+template <typename InRetValType, typename... ParamTypes, typename UserPolicy>
+class TDelegate<InRetValType(ParamTypes...), UserPolicy> : public TDelegateBase<FThreadSafetyMode>
+```
+根据上面的 `using FThreadSafetyMode =FNotThreadSafeDelegateMode;` 可以知道父类是:
+```cpp
+template<typename ThreadSafetyMode>
+class TDelegateBase : public TDelegateAccessHandlerBase<ThreadSafetyMode>
+
+/* using 代入得到: */
+
+template<typename ThreadSafetyMode>
+class TDelegateBase : public TDelegateAccessHandlerBase<FNotThreadSafeDelegateMode>
+
+template<>
+class TDelegateAccessHandlerBase<FNotThreadSafeDelegateMode>
+```
+
+`TDelegateAccessHandlerBase`是最基的类，模板参数是关于线程安全的，那么这个类应该是关于线程安全的类.
+
+---
+
+从 `TDelegate` 类开始分析.
+```cpp
+using FMyDelegate = TDelegate<void(int)>;
+
+class AMyActor : public AActor
+{
+    FMyDelegate MyDelegate; 
+}
+
+void MyGlobalFunc(int Value, int Payload) 
+{
+	UE_LOG(LogTemp, Log, TEXT("Global Func Called with Value: %d, Payload: %d"), Value, Payload)
+}
+
+void AMyActor::BeginPlay()
+{
+	Super::BeginPlay();
+	
+	MyDelegate.BindStatic(&MyGlobalFunc, 42);
+	MyDelegate.ExecuteIfBound(2);
+}
+```
+
+运行结果:
+```cpp
+LogTemp: Global Func Called with Value: 2, Payload: 42
+```
+
+---
+
+### StaticFunc
+
+通过 `BindStatic` 和 `Execute` 说明机制，<br>
+其他 `Bind` 方法的机制与这个相似，只是 调用 或 存放函数指针 的方法不同.
+
+![alt text](Meta/img1/Delegate_Static.png)
+
+要存放一个函数，首先要有函数指针，其次是函数的参数，<br>
+只要解决这两个问题，就可以实现委托机制.
+
+`BindStatic`:
+```cpp
+template <typename... VarTypes>
+inline void BindStatic(typename TBaseStaticDelegateInstance<FuncType, UserPolicy, std::decay_t<VarTypes>...>::FFuncPtr InFunc, VarTypes&&... Vars)
+{
+    Super::template CreateDelegateInstance<TBaseStaticDelegateInstance<FuncType, UserPolicy, std::decay_t<VarTypes>...>>(InFunc, Forward<VarTypes>(Vars)...);
+}
+```
+
+`FuncType` 是 `void(int)`。<br>
+`VarTypes...` 被推导为 `int`(因为 `42`)。<br>
+`Super` 是 `UserPolicy::FDelegateExtras`，<br>
+对于默认策略 `FDefaultDelegateUserPolicy` 就是 `TDelegateBase<FNotThreadSafeDelegateMode>`。<br>
+
+所以这里实际调用的是基类 `TDelegateBase` 的 `CreateDelegateInstance` 模板函数，并传递`函数指针`和`载荷参数`。
+
+`CreateDelegateInstance` :
+```cpp
+template<typename DelegateInstanceType, typename... DelegateInstanceParams>
+void CreateDelegateInstance(DelegateInstanceParams&&... Params)
+{
+     // (1) 获取写作用域（线程安全/检测）
+    FWriteAccessScope WriteScope = GetWriteAccessScope();              
+     // (2) 获取已有实例
+    IDelegateInstance* DelegateInstance = GetDelegateInstanceProtected();
+    if (DelegateInstance)
+    {
+        // (3) 析构旧实例
+        DelegateInstance->~IDelegateInstance();                         
+    }
+    new (Allocate(sizeof(DelegateInstanceType))) DelegateInstanceType(Forward<DelegateInstanceParams>(Params)...); 
+    // (4) 构造新实例
+}
+```
+
+`GetDelegateInstanceProtected()` 返回当前存储的 `IDelegateInstance*`。<br>
+由于 `MyDelegate` 刚刚默认构造，`DelegateSize` 为 `0`，返回 `nullptr`，所以跳过析构。
+
+`Allocate(sizeof(DelegateInstanceType))` 计算所需块数（每块 `FAlignedInlineDelegateType`，默认 16 字节对齐），<br>
+然后调用 `DelegateAllocator.ResizeAllocation` 调整内存。<br>
+`DelegateAllocator` 的类型是 `FDelegateAllocatorType::ForElementType<FAlignedInlineDelegateType>`，<br>
+分配器返回指向内存的指针，该内存用于 `placement new`。
+
+对于`BindStatic`这个例子:<br>
+```cpp
+template <typename... VarTypes>
+inline void BindStatic(typename TBaseStaticDelegateInstance</**/>::FFuncPtr InFunc, VarTypes&&... Vars)
+{
+    Super::template CreateDelegateInstance<TBaseStaticDelegateInstance</**/>(InFunc, Forward<VarTypes>(Vars)...);
+}
+```
+`new (地址) DelegateInstanceType(...)` <br>
+在分配的内存上构造 `TBaseStaticDelegateInstance` 对象。<br>
+`DelegateInstanceType` 是 `TBaseStaticDelegateInstance<void(int), FDefaultDelegateUserPolicy, int>`.
+
+
+`TBaseStaticDelegateInstance` 的构造:
+```cpp
+template <typename RetValType, typename... ParamTypes, typename UserPolicy, typename... VarTypes>
+class TBaseStaticDelegateInstance<RetValType(ParamTypes...), UserPolicy, VarTypes...>
+    : public TCommonDelegateInstanceState<RetValType(ParamTypes...), UserPolicy, VarTypes...>
+{
+public:
+    using FFuncPtr = RetValType(*)(ParamTypes..., VarTypes...);
+    template <typename... InVarTypes>
+    explicit TBaseStaticDelegateInstance(FFuncPtr InStaticFuncPtr, InVarTypes&&... Vars)
+        : Super(Forward<InVarTypes>(Vars)...)
+        , StaticFuncPtr(InStaticFuncPtr) 
+        {}
+    // ...
+private:
+    FFuncPtr StaticFuncPtr;
+};
+```
+
+`Super` 是 `TCommonDelegateInstanceState<...>`，负责存储载荷和委托句柄。<br>
+构造函数接收函数指针 `InStaticFuncPtr` 和载荷参数 `Vars...`（这里 42）。<br>
+调用基类构造函数 `Super(Forward<InVarTypes>(Vars)...)` 将载荷传递给 `TCommonDelegateInstanceState`。<br>
+将函数指针保存到 `StaticFuncPtr`。<br>
+
+
+`TCommonDelegateInstanceState`:
+```cpp
+template <typename FuncType, typename UserPolicy, typename... VarTypes>
+class TCommonDelegateInstanceState : IBaseDelegateInstance<FuncType, UserPolicy>
+{
+public:
+    template <typename... InVarTypes>
+    explicit TCommonDelegateInstanceState(InVarTypes&&... Vars)
+        : Payload(Forward<InVarTypes>(Vars)...)
+        , Handle(FDelegateHandle::GenerateNewHandle) 
+        {}
+    // ...
+protected:
+    TTuple<VarTypes...> Payload;
+    FDelegateHandle Handle;
+};
+```
+它利用 `TTuple` 存储载荷，并为这个绑定生成唯一的委托句柄。
+
+---
+
+执行:
+
+```cpp
+void MyGlobalFunc(int Value, int Payload) 
+{
+	UE_LOG(LogTemp, Log, TEXT("Global Func Called with Value: %d, Payload: %d"), Value, Payload)
+}
+
+void AMyActor::BeginPlay()
+{
+	Super::BeginPlay();
+	
+	MyDelegate.BindStatic(&MyGlobalFunc, 42);
+	MyDelegate.ExecuteIfBound(2);
+}
+```
+
+运行结果:
+```cpp
+LogTemp: Global Func Called with Value: 2, Payload: 42
+```
+
+```cpp
+RetValType Execute(ParamTypes... Params) const
+{
+	FReadAccessScope ReadScope = GetReadAccessScope();
+
+	const DelegateInstanceInterfaceType* LocalDelegateInstance = GetDelegateInstanceProtected();
+
+	// If this assert goes off, Execute() was called before a function was bound to the delegate.
+	// Consider using ExecuteIfBound() instead.
+	checkSlow(LocalDelegateInstance != nullptr);
+
+	return LocalDelegateInstance->Execute(Forward<ParamTypes>(Params)...);
+}
+```
+
+当调用 `MyDelegate.Execute(2)` 时，`TDelegate::Execute` 最终调用委托实例的 `Execute` 方法。<br>
+对于 `TBaseStaticDelegateInstance`，其 `Execute` 实现如下:
+
+```cpp
+RetValType Execute(ParamTypes... Params) const final
+{
+    // 将载荷与参数组合后调用函数指针
+    return this->Payload.ApplyAfter(StaticFuncPtr, Forward<ParamTypes>(Params)...);
+}
+```
+
+`ApplyAfter` 是 `TTuple` 的函数，它会将 `Params...` 作为前几个参数，将 Payload 中的元素作为剩余参数，一起调用 `StaticFuncPtr`。<br>
+对于这个例子：<br>
+`Params...` 是 `(int)`，即 `5`。<br>
+`Payload` 包含一个 `int`，即 `42`。<br>
+最终调用 `StaticFuncPtr(5, 42)`。<br>
+因此，`42` 这个载荷值确实被保留并在执行时传递给了 `MyGlobalFunc`。<br>
+
+
+`ApplyAfter` : 
+```cpp
+template <typename FuncType, typename... ArgTypes>
+decltype(auto) ApplyAfter(FuncType&& Func, ArgTypes&&... Args) & 
+{
+    return ::Invoke(Func, Forward<ArgTypes>(Args)...
+    , static_cast<TTupleBase&>(*this).template Get<Indices>()...);
+}
+```
+
+`Indices` 是一个 `TIntegerSequence<uint32, 0, 1, ..., N-1>`，其中 N 是元组中元素的数量。<br>
+`Get<Indices>()...` 会按顺序展开成 `Get<0>(), Get<1>(), ..., Get<N-1>()`，即元组的所有元素。<br>
+因此，调用 `::Invoke(Func, Args..., 元素0, 元素1, ...)` 时，<br>
+`Args...`（即 `Params...`）被放在前面，元组的元素被放在后面。<br>
+
+在委托系统中，`Payload` 被存储为 `TTuple<VarTypes...>`，而执行时传入的参数就是 `ParamTypes...`.<br>
+通过 `ApplyAfter`，正好实现了“委托签名参数在前，载荷参数在后”的调用约定，<br>
+从而与 `CreateStatic / BindStatic` 中函数指针的类型 `Ret(*)(ParamTypes..., VarTypes...)` 完美匹配。
+
+
+---
 
 
 
+### 多播委托
+
+```cpp
+using FMyDelegate = TMulticastDelegate<void(int)>;
+FMyDelegate MyDelegate;
+
+void MyGlobalFunc(int Value, int Payload) 
+{
+	UE_LOG(LogTemp, Log, TEXT("Global Func Called with Value: %d, Payload: %d"), Value, Payload)
+}
+
+void AMyActor::BeginPlay()
+{
+	Super::BeginPlay();
+	
+	MyDelegate.AddStatic(&MyGlobalFunc,42);
+	MyDelegate.Broadcast(2);
+}
+```
+`AddStatic` :
+```cpp
+template <typename... VarTypes>
+FDelegateHandle AddStatic(typename TBaseStaticDelegateInstance<void (ParamTypes...), UserPolicy, std::decay_t<VarTypes>...>::FFuncPtr InFunc, VarTypes&&... Vars)
+{
+	return Super::AddDelegateInstance(FDelegate::CreateStatic(InFunc, Forward<VarTypes>(Vars)...));
+}
+```
+
+多播委托内部维护一个存放单播委托实例的数组，每个元素本质上就是一个单播委托的基类对象。<br>
+当通过 `AddStatic`、`AddLambda` 等方法添加绑定时，<br>
+内部会先用 `FDelegate::CreateStatic`或 `CreateLambda` 创建一个单播委托，然后将它存入数组。
+
+在 `TMulticastDelegateBase` 中，调用列表的类型是:
+```cpp
+using UnicastDelegateType = TDelegateBase<FNotThreadSafeNotCheckedDelegateMode>;
+
+using InvocationListType = TArray<UnicastDelegateType, FMulticastInvocationListAllocatorType>;
+
+InvocationListType InvocationList;
+```
+
+也就是说，数组中存储的是 `TDelegateBase` 对象，而不是完整的 `TDelegate`。<br>
+因为多播只需要存储委托实例本身 `IDelegateInstance*` 并提供 `Unbind`、`GetDelegateInstanceProtected` 等基础操作，<br>
+不需要 `TDelegate` 中那些类型安全的绑定和执行的公共接口。<br>
+这样设计既节省空间，也避免了不必要的模板实例化。
+
+---
+
+## AssetManager
+
+
+---
+
+
+## 动画蓝图
+
+
+---
+
+# Gameplay系统
 
 
 
+## AI
+
+### AI感知
+
+感知系统为Pawn提供了一种从环境中接收数据的方式，例如噪音的来源、AI是否遭到破坏、或AI是否看到了什么。<br>
+这通过 AI感知组件`AIPerceptionComponent` 来完成。<br>
+该组件相当于刺激监听器，将收集已注册的刺激源。
+
+刺激源被注册后将调用 `OnPerceptionUpdated` （或用于目标选择的 `OnTargetPerceptionUpdated` ）事件.<br>
+
+---
+
+#### 组件注册
+
+```cpp
+void UAIPerceptionComponent::OnRegister()
+{
+	AActor* Owner = GetOwner();
+	AIOwner = Cast<AAIController>(Owner);
+	UAIPerceptionSystem* AIPerceptionSys = UAIPerceptionSystem::GetCurrent(GetWorld());
+	/* 注册感知 -省略- 见下图 */
+}
+```
+![alt text](Meta/img1/adding-senses.png)
+
+向 `UAIPerceptionSystem` 注册感知:
+
+![alt text](Meta/img1/adding-senses_code.png)
 
 
 
+`UAIPerceptionSystem` 是哪里来的?
+
+```cpp
+void UAISystem::PostInitProperties()
+{
+	TSubclassOf<UAIPerceptionSystem> PerceptionSystemClass = LoadClass<UAIPerceptionSystem>(NULL, *PerceptionSystemClassName.ToString(), NULL, LOAD_None, NULL) 
+
+	if (PerceptionSystemClass)
+	{
+		PerceptionSystem = NewObject<UAIPerceptionSystem>(this, PerceptionSystemClass, TEXT("PerceptionSystem"));
+	}
+
+	PawnBeginPlayDelegateHandle = APawn::OnPawnBeginPlay.AddUObject(this, &UAISystem::OnPawnBeginPlay);
+}
+```
+<font color="yellow">注意</font>: `UAISystem`监听了Pawn的生成事件，每当有一个Pawn类被生成出来执行BeginPlay时，`UAISystem`都会响应这个动作.
+
+`PerceptionSystemClass` 在`BaseEngine.ini`中定义 : 
+```
+[/Script/AIModule.AISystem]
+PerceptionSystemClassName=/Script/AIModule.AIPerceptionSystem
+```
+
+所以 `UAIPerceptionSystem` 是由`UAISystem`创建的， <br>
+那么 `UAISystem`是哪里来的?
+
+![](Meta/img1/Gameplay.png)
+
+上图左上角的`AI`部分 就是创建`UAISystem`的地方 - `UWorld::CreateAISystem()`<br>
+
+```cpp
+TSubclassOf<UAISystemBase> AISystemClass = LoadClass<UAISystemBase>(nullptr, *AISystemClassName.ToString(), nullptr, LOAD_None, nullptr);
+
+AISystemInstance = AISystemClass ? NewObject<UAISystemBase>(World, AISystemClass) : nullptr;
+```
+加载`AISystemClassName`指定的类，在`BaseEngine.ini`中定义:
+```
+[/Script/Engine.AISystemBase]
+AISystemModuleName=AIModule
+AISystemClassName=/Script/AIModule.AISystem
+```
+
+---
+
+整理一下，<br>
+`BaseEngine.ini` 定义了要创建的 `AISystemClassName`， 在 `UWorld` 初始化时 创建指定的 `AISystem` 类，<br>
+之后，在 `AISystem` 的 `PostInitProperties` 中，创建 `UAIPerceptionSystem` 感知系统，
+
+---
+
+回到`AIPerceptionComponent` :
+```cpp
+void UAIPerceptionComponent::OnRegister()
+{
+	UAIPerceptionSystem* AIPerceptionSys = UAIPerceptionSystem::GetCurrent(GetWorld());
+	if (AIPerceptionSys != nullptr)
+	{
+		PerceptionFilter.Clear();
+
+		if (SensesConfig.Num() > 0)
+		{
+			// set up perception listener based on SensesConfig
+			for (auto SenseConfig : SensesConfig)
+			{
+				if (SenseConfig)
+				{
+					RegisterSenseConfig(*SenseConfig, *AIPerceptionSys);
+				}
+			}
+
+			AIPerceptionSys->UpdateListener(*this);
+		}
+	}
+}
+```
+
+在组件注册时，把组件中配置的感知属性 注册到 `UAIPerceptionSystem` 感知系统中， 如下代码 :<br>
+```cpp
+void UAIPerceptionComponent::RegisterSenseConfig(UAISenseConfig& SenseConfig, UAIPerceptionSystem& AIPerceptionSys)
+{
+	const TSubclassOf<UAISense> SenseImplementation = SenseConfig.GetSenseImplementation();
+	if (SenseImplementation)
+	{
+		// make sure it's registered with perception system
+		const FAISenseID SenseID = AIPerceptionSys.RegisterSenseClass(SenseImplementation);
+	}
+	/*...*/
+}
+```
+
+举例说明注册过程：
+
+![](Meta/img1/perception-sight.png)
+
+以此图为例，`SenseConfig`下面可以添加各种`Config`，<br>
+上图添加了`AISightConfig`，第一个配置项`Implementation`是具体的`UAISense`类，<br>
+```cpp
+const TSubclassOf<UAISense> SenseImplementation = SenseConfig.GetSenseImplementation();
+const FAISenseID SenseID = AIPerceptionSys.RegisterSenseClass(SenseImplementation);
+```
+这里获取的就是`AISightConfig`里面的`Implementation`类， 将其传给`UAIPerceptionSystem`.<br>
+```cpp
+UPROPERTY()
+TArray<TObjectPtr<UAISense>> Senses;
+	
+FAISenseID UAIPerceptionSystem::RegisterSenseClass(TSubclassOf<UAISense> SenseClass)
+{
+	FAISenseID SenseID = UAISense::GetSenseID(SenseClass);
+	if (Senses[SenseID] == nullptr)
+	{
+		Senses[SenseID] = NewObject<UAISense>(this, SenseClass);
+	}
+}
+```
+
+这里就有一个问题:<br>
+为什么要使用 `if (Senses[SenseID] == nullptr)` 判断是否存在某个`UAISense`类？
+
+```cpp
+static FAISenseID GetSenseID(const TSubclassOf<UAISense> SenseClass) 
+{ 	return SenseClass 
+	? ((const UAISense*)SenseClass->GetDefaultObject())->SenseID 
+	: FAISenseID::InvalidID(); 
+}
+```
+
+`GetSenseID`获取的是CDO的ID，而CDO只有一个，<br>
+
+一个AI控制器里面有一个`UAIPerceptionComponent`组件，这个组件里面又有`SenseConfig`，<br>
+游戏运行时，场上可以有多个AI控制器，这些AI控制器里面的 `感知组件` 要向感知系统`UAIPerceptionSystem`注册`UAISense`，<br>
+
+`UAIPerceptionSystem` 却使用 `UAISense` CDO的ID 来判断一个`UAISense`是否存在，<br>
+这就会导致 场上的所有AI控制器 共享同一个 `UAISense` 类 (因为CDO只有一个)， 也就是 `NewObject` 创造出来的那一个`UAISense`:
+```cpp
+Senses[SenseID] = NewObject<UAISense>(this, SenseClass);
+```
+
+---
+
+```cpp
+void UAIPerceptionComponent::OnRegister()
+{
+	UAIPerceptionSystem* AIPerceptionSys = UAIPerceptionSystem::GetCurrent(GetWorld());
+	if (AIPerceptionSys != nullptr)
+	{
+		// set up perception listener based on SensesConfig
+		for (auto SenseConfig : SensesConfig)
+		{
+			if (SenseConfig)
+			{
+				RegisterSenseConfig(*SenseConfig, *AIPerceptionSys);
+			}
+		}
+		AIPerceptionSys->UpdateListener(*this);	
+	}
+}
+```
+
+在NewObject完了之后，`UpdateListener(*this)` : 组件将作为 `Listener` 向 `UAIPerceptionSystem` 进行注册，<br>
+
+`Listener`这个词描述了这样的情况: `UAISense`会发出消息，组件来监听消息.
+
+
+```cpp
+void UAIPerceptionSystem::UpdateListener(UAIPerceptionComponent& Listener)
+{
+	const FPerceptionListenerID ListenerId = Listener.GetListenerId();
+	if (ListenerId != FPerceptionListenerID::InvalidID())
+	{
+		FPerceptionListener& ListenerEntry = ListenerContainer[ListenerId];
+		ListenerEntry.UpdateListenerProperties(Listener);
+		OnListenerUpdate(ListenerEntry);
+	}
+	else
+	{			
+		const FPerceptionListenerID NewListenerId = FPerceptionListenerID::GetNextID();
+		Listener.StoreListenerId(NewListenerId);
+		FPerceptionListener& ListenerEntry = ListenerContainer.Add(NewListenerId, FPerceptionListener(Listener));
+		ListenerEntry.CacheLocation();
+				
+		OnNewListener(ListenerContainer[NewListenerId]);
+	}
+}
+```
+
+当组件第一次向 `UAIPerceptionSystem` 注册时，组件是没有ID的，
+```cpp
+if (ListenerId != FPerceptionListenerID::InvalidID())
+```
+这个条件判断为`false`， 所以会走下面这个分支:
+```cpp
+const FPerceptionListenerID NewListenerId = FPerceptionListenerID::GetNextID();
+Listener.StoreListenerId(NewListenerId);
+FPerceptionListener& ListenerEntry = ListenerContainer.Add(NewListenerId, FPerceptionListener(Listener));
+ListenerEntry.CacheLocation();
+				
+OnNewListener(ListenerContainer[NewListenerId]);
+```
+
+这段代码给组件分配一个ID，一个ID对应一个组件，存放在TMap里 :
+```cpp
+TMap<FPerceptionListenerID, FPerceptionListener> ListenerContainer
+```
+
+`CacheLocation` 缓存AI控制器 所控制的`Pawn` 的位置和旋转.<br>
+
+```cpp
+void UAIPerceptionSystem::OnNewListener(const FPerceptionListener& NewListener)
+{
+	for (UAISense* const SenseInstance : Senses)
+	{
+		// @todo filter out the ones that do not declare using this sense
+		if (SenseInstance != nullptr && NewListener.HasSense(SenseInstance->GetSenseID()))
+		{
+			SenseInstance->OnNewListener(NewListener);
+		}
+	}
+}
+```
+
+`OnNewListener` 通知所有`Sense`感官，这些`SenseInstance`可以获得AI控制器里面的感官组件.
+
+
+---
+
+#### Pawn的信息
+
+要让AI拥有感知，AI首先要知道场上的角色或者玩家的信息.
+
+```cpp
+void UAISystem::PostInitProperties()
+{
+	PerceptionSystem = NewObject<UAIPerceptionSystem>(this, PerceptionSystemClass, TEXT("PerceptionSystem"));
+
+	PawnBeginPlayDelegateHandle = APawn::OnPawnBeginPlay.AddUObject(this, &UAISystem::OnPawnBeginPlay);
+}
+
+void UAISystem::OnPawnBeginPlay(APawn* Pawn)
+{
+	PerceptionSystem->OnNewPawn(*Pawn);
+}
+
+void UAIPerceptionSystem::OnNewPawn(APawn& Pawn)
+{
+	for (UAISense* Sense : Senses)
+	{
+		FAISenseID SenseID = Sense->GetSenseID();
+		SourcesToRegister.AddUnique(FPerceptionSourceRegistration(SenseID, &SourceActor));
+	}
+}
+
+TArray<FPerceptionSourceRegistration> SourcesToRegister;
+```
+
+当有一个新的Pawn被生成时，AI系统会做出响应，`OnNewPawn` 将这个Pawn注册到AI系统中.<br>
+每一个`UAISense`都会获得Pawn的信息.
+
+`SourcesToRegister` 保存每个`UAISense`的ID和Pawn，在 `Tick` 时处理它们:
+
+```cpp
+void UAIPerceptionSystem::Tick(float DeltaSeconds)
+{
+	if (SourcesToRegister.Num() > 0)
+	{
+		PerformSourceRegistration();
+	}
+}
+```
+![](Meta/img1/PerformSourceReg.png)
+
+当Pawn销毁时，也有对应的操作，上图代码中绑定了Pawn的`OnEndPlay`事件，
+```cpp
+UAIPerceptionSystem::UAIPerceptionSystem()
+{
+	StimuliSourceEndPlayDelegate.BindDynamic(this, &UAIPerceptionSystem::OnPerceptionStimuliSourceEndPlay);
+}
+
+void UAIPerceptionSystem::OnPerceptionStimuliSourceEndPlay(AActor* Actor, EEndPlayReason::Type EndPlayReason)
+{
+	UnregisterSource(*Actor);
+}
+```
+
+在Pawn销毁时，反向执行前面的逻辑，前面添加了 这里就要移除.
+
+---
+
+#### 视觉感知
+
+![](Meta/img1/perception-sight.png)
+
+`AIPerceptionComponent` 可以配置AI感知，<br>
+`AISightConfig` 包含一些特有的配置项，`AISense_Sight`只有一份，而`Config`里的数据是动态创建的，可以有多种不同配置参数.<br>
+问题:`Config`数据如何传给`AISense_Sight` ?
+
+`AISense_Sight` 是由感知系统使用 `NewObject` 创建出来的，所以 从`NewObject`开始追踪数据.
+
+![](Meta/img1/AISense_Sight.png)
+
+`AISense_Sight` 的核心在于`Update`函数.
+
+`Update`函数的操作如下:<br>
+由于遍历次数是 `SightQueriesInRange` 和 `SightQueriesOutOfRange` 的数量总和，<br>
+所以需要 `InRangeItr` 和 `OutOfRangeItr` 来标记两个数组的遍历索引，<br>
+因为是同时遍历两个数组，所以在每次遍历时 要比较两个数组中取出的元素的分数，<br>
+哪个分数高，就优先计算哪个元素，<br>
+
+`SightQuery` 可以代表一个`AIPerceptionComponent`，<br>
+也就是说 `SightQuery` 可以获得AI控制器所控制的角色信息，<br>
+有了AI角色的信息 也有了 `ObservedTargets` 数组保存的其他 `Pawn` 的信息 ，<br>
+这样就可以计算一个AI角色和所有其他 `Pawn` 的位置，判断AI能否看到某个 `Pawn` ，<br>
+
+然后遍历每个 `SightQuery` ，计算每个AI角色能否看到其他 `Pawn`.<br>
+
+如果能看到某个 `Pawn`，就把这个 `Pawn` 传给 `AIPerceptionComponent` ，<br>
+
+之后 在 `UAIPerceptionSystem::Tick` 下，处理每个 `AIPerceptionComponent` 看到的Pawn，
+触发 `OnTargetPerceptionUpdated` 传给蓝图 . 
+
+---
+
+在`UAISense_Sight::GenerateQueriesForListener`函数中，<br>
+把ObservedTargets里的每一个Actor 都注册到Query中，一个Listener可以对应多个Actor，<br>
+实际上 这里是这样做的:注册多个Query，每个Query保存一个Listener和一个Actor的对应关系
+
+所以在 `Update()` 中:
+```cpp
+FPerceptionListener& Listener = ListenersMap[SightQuery->ObserverId];
+FAISightTarget& Target = ObservedTargets[SightQuery->TargetId];
+
+AActor* TargetActor = Target.Target.Get();
+UAIPerceptionComponent* ListenerPtr = Listener.Listener.Get();
+```
+
+在多次遍历过程中，这一段的 `ListenerPtr` 有可能是同一个组件，而 `TargetActor` 是不同的.
+
+
+---
+
+```cpp
+void UAIPerceptionSystem::Tick(float DeltaSeconds)
+{
+	for (UAISense* const SenseInstance : Senses)
+	{
+		if (SenseInstance != nullptr)
+		{
+			SenseInstance->Tick();
+		}
+	}
+
+	for (AIPerception::FListenerMap::TIterator ListenerIt(ListenerContainer); ListenerIt; ++ListenerIt)
+	{
+		check(ListenerIt->Value.Listener.IsValid());
+
+		if (ListenerIt->Value.HasAnyNewStimuli())
+		{
+			ListenerIt->Value.ProcessStimuli();
+		}
+	}
+}
+
+void FPerceptionListener::ProcessStimuli()
+{
+	ensure(bHasStimulusToProcess);
+	Listener->ProcessStimuli();
+	bHasStimulusToProcess = false;
+}
+```
+
+`Update`是由`UAIPerceptionSystem::Tick`驱动的，<br>
+在 `UAISense` 处理完 `Update` 之后， <br>
+调用`UAIPerceptionComponent::ProcessStimuli`，处理刺激源，也就是看到的 `Pawn`.
+
+接着，下图中的函数 会被调用 :
+
+![](Meta/img1/BP_OnTargetUpdate.png)
+
+
+---
+
+
+#### 伤害感知
+
+伤害类没有那么多操作，伤害是一对一的，<br>
+玩家A伤害了一个AI，只有受到伤害的 AI 自己会收到感知刺激，其他 AI 并不会自动得知这个伤害事件.
+
+`UAISense_Damage` 提供了一个蓝图可调用的静态函数，
+```cpp
+void UAISense_Damage::ReportDamageEvent(UObject* WorldContextObject, 
+AActor* DamagedActor, AActor* Instigator, float DamageAmount, 
+FVector EventLocation, FVector HitLocation, 
+FName Tag/* = NAME_None*/)
+{
+	UAIPerceptionSystem* PerceptionSystem = UAIPerceptionSystem::GetCurrent(WorldContextObject);
+	if (PerceptionSystem)
+	{
+		FAIDamageEvent Event(DamagedActor, Instigator, DamageAmount, EventLocation, HitLocation, Tag);
+		PerceptionSystem->OnEvent(Event);
+	}
+}
+```
+向 `UAIPerceptionSystem` 报告事件，`OnEvent` 是一个模板函数:
+```cpp
+template<typename FEventClass, typename FSenseClass = typename FEventClass::FSenseClass>
+void OnEvent(const FEventClass& Event)
+{
+	const FAISenseID SenseID = UAISense::GetSenseID<FSenseClass>();
+	if (Senses.IsValidIndex(SenseID) && Senses[SenseID] != nullptr)
+	{
+		((FSenseClass*)Senses[SenseID])->RegisterEvent(Event);
+	}
+	// otherwise there's no one interested in this event, skip it.
+}
+
+template<typename TSense>
+static FAISenseID GetSenseID() 
+{ 
+	return GetDefault<TSense>()->GetSenseID();
+}
+```
+这个模板函数要求声明`FSenseClass`，用于查找对应的 `SenseID` : <br>
+`FAIDamageEvent` 声明了 `FSenseClass`  是 `UAISense_Damage` 类.
+```cpp
+USTRUCT(BlueprintType)
+struct FAIDamageEvent
+{	
+	GENERATED_USTRUCT_BODY()
+
+	typedef class UAISense_Damage FSenseClass;
+}
+```
+
+所以 会来到下面这个函数:
+```cpp
+void UAISense_Damage::RegisterEvent(const FAIDamageEvent& Event)
+{
+	if (Event.IsValid())
+	{
+		RegisteredEvents.Add(Event);
+
+		RequestImmediateUpdate();
+	}
+}
+```
+
+在`Update`中 处理`RegisteredEvents`。
+
+
+---
+
+
+#### 听觉感知
+
+听觉感知是群体事件，所有AI都会受到影响.<br>
+可以模拟声音传播的速度，距离事发地点远的AI 会延迟做出反应.
+
+```cpp
+class UAISense_Hearing : public UAISense
+{
+	GENERATED_UCLASS_BODY()
+		
+protected:
+	/** Defaults to 0 to have instant notification. Setting to > 0 will result in delaying 
+	 *	when AI hears the sound based on the distance from the source */
+	UPROPERTY(config)
+	float SpeedOfSoundSq;
+}
+```
+
+`SpeedOfSoundSq` : 默认值设为 0 以实现即时通知。<br>
+将该值设置为大于 0 的数值，则会根据声音源与设备之间的距离来延迟 AI 听到声音的时间.
+
+这个变量在`BaseGame.ini`中配置:
+```
+[/Script/AIModule.AISense_Hearing]
+SpeedOfSoundSq=0
+```
+
+`UAISense_Hearing` 依旧提供了蓝图函数 `ReportNoiseEvent` 用来上传事件，<br>
+
+---
+
+
+#### 预测
+
+`UAISense_Prediction` 根据玩家的位置和速度，预测N秒后 玩家的位置.
+
+这个行为是单个AI的行为，并非群体行为，例如 听觉感知是群体行为.
+
+依然提供了静态的蓝图函数，
+
+```cpp
+static void RequestControllerPredictionEvent(AAIController* Requestor, AActor* PredictedActor, float PredictionTime);
+
+static void RequestPawnPredictionEvent(APawn* Requestor, AActor* PredictedActor, float PredictionTime);
+
+struct FAIPredictionEvent 
+{
+    AActor* Requestor;        // 请求者（通常是 AI Controller）
+    AActor* PredictedActor;   // 要被预测的目标
+    float TimeToPredict;      // 预测多少秒后的位置
+};
+```
+`Update` :
+```cpp
+float UAISense_Prediction::Update()
+{
+    for (const FAIPredictionEvent& Event : RegisteredEvents)
+    {
+        // 1. 有效性检查
+        if (Event.Requestor && Event.PredictedActor)
+        {
+            // 2. 获取请求者的感知组件
+            IAIPerceptionListenerInterface* PerceptionListener = Cast<...>(Event.Requestor);
+            UAIPerceptionComponent* PerceptionComponent = PerceptionListener->GetPerceptionComponent();
+            
+            // 3. 确认监听器存在且启用了本感知
+            if (PerceptionComponent && ListenersMap.Contains(PerceptionComponent->GetListenerId())
+                && Listener.HasSense(GetSenseID()))
+            {
+                // 4. 计算预测位置：当前位置 + 速度 × 时间
+                const FVector PredictedLocation = 
+				Event.PredictedActor->GetActorLocation() + 
+				Event.PredictedActor->GetVelocity() * Event.TimeToPredict;
+
+                // 5. 注册为刺激（强度固定为 1.0）
+                Listener.RegisterStimulus(Event.PredictedActor, 
+                    FAIStimulus(*this, 1.f, PredictedLocation, Listener.CachedLocation));
+            }
+        }
+    }
+    RegisteredEvents.Reset();
+    return SuspendNextUpdate; 
+}
+```
+
+---
+
+
+#### 团队
+
+感知组件的拥有者向团队报告 有人在附近（发送该事件的游戏代码也会发送半径距离）.
+
+
+这个类没有提供静态蓝图函数，还要自己写.
+
+```cpp
+FAITeamStimulusEvent::FAITeamStimulusEvent
+(
+	AActor* InBroadcaster, AActor* InEnemy, 
+	const FVector& InLastKnowLocation, 
+	float EventRange, float PassedInfoAge, float InStrength
+)
+	: LastKnowLocation(InLastKnowLocation), RangeSq(FMath::Square(EventRange)), InformationAge(PassedInfoAge), Strength(InStrength), Broadcaster(InBroadcaster), Enemy(InEnemy)
+{
+	CacheBroadcastLocation();
+
+	TeamIdentifier = FGenericTeamId::GetTeamIdentifier(InBroadcaster);
+}
+```
+
+只要填充 `Event` 的构造函数即可，
+
+---
+
+
+#### 触碰
+
+触碰是一对一，单个AI的行为.
+
+让 AI 能够感知到与其他 Actor 的物理接触（例如被玩家近战攻击、碰撞或触碰）。<br>
+当发生接触事件时，可以主动报告，AI 会收到一个刺激，从而做出反应（如受击反馈、警戒等）。
+
+举例而言，在潜入类型的游戏中，可能希望玩家在不接触敌方AI的情况下偷偷绕过他们。<br>
+使用此感官可以确定玩家与AI发生接触，并能用不同逻辑做出响应。
+
+```cpp
+struct FAITouchEvent 
+{
+    AActor* TouchReceiver;  // 被触碰的 Actor（通常是 AI 自身或 AI 控制的角色）
+    AActor* OtherActor;     // 触碰的发起者（例如玩家）
+    FVector Location;       // 触碰发生的位置
+};
+```
+
+
+---
+
+### 行为树
+
+![](Meta/img1/behavior-tree-quick-start-step-3-2-1.png)
+
+![](Meta/img1/RunBehaviorTree.png)
+
+上图简单的追踪了一下代码，描述了行为树的加载、节点的执行.
+
+在行为树组件的`TickComponent`中，先使用`ExecuteOnEachAuxNode`执行辅助节点的Tick，<br>
+辅助节点包括装饰器、Service，在它们执行之后 才Tick那些普通的节点，
+
+---
+
+
+#### 装饰器
+
+装饰器 是放置在父-子连接上的辅助节点，能够接收执行流程的通知并可以被 `Tick` .
+
+![](Meta/img1/BehaviorTree_If.png)
+
+![](Meta/img1/Action_If.png)
+
+
+在 `ActionRPG` 中，也是使用装饰器来判断一些条件，决定这个分支要不要执行.
+
+![](Meta/img1/Dc_RandV.png)
+
+装饰器监听了 `BlackBoardKey` 值的变化，<br>
+当某个装饰器执行时，行为树组件会执行这个装饰器的`WrappedOnBecomeRelevant`函数，函数内部会监听值的变化，<br>
+
+每次 `SetBlackboardValueaAsObject` 之类的函数被调用时，对应装饰器的监听就会被触发,
+
+---
+
+Q:上图有两个装饰器 `CanSeePlayer`和`CloseEnoughToAcack`，它们的区别是什么？
+
+A:左侧使用`ResultChange` 右侧使用`ValueChange`
+
+`EBTDecoratorAbortRequest::ConditionResultChanged`<br>
+`EBTDecoratorAbortRequest::ConditionPassing
+
+`ResultChange` 对应 `ConditionResultChanged`<br>
+在 `ConditionalFlowAbort` 中，只有当条件结果发生变化（即 `bIsExecutingBranch != bPass`）时，才会请求中止。
+
+`ValueChange` 对应 `ConditionPassing`<br>
+除了结果变化会触发外，只要正在执行该分支且条件为真（`bIsExecutingBranch && bPass`），即使结果未变，也会强制请求中止。
+
+当所选的 `BlackboardKey` 的值发生变化时，下面的函数会触发:
+```cpp
+EBlackboardNotificationResult UBTDecorator_Blackboard::OnBlackboardKeyValueChange(const UBlackboardComponent& Blackboard, FBlackboard::FKey ChangedKeyID)
+{
+	if (BlackboardKey.GetSelectedKeyID() == ChangedKeyID)
+	{
+		// can't simply use BehaviorComp->RequestExecution(this) here, we need to support condition/value change modes
+
+		const EBTDecoratorAbortRequest RequestMode = 
+		(NotifyObserver == EBTBlackboardRestart::ValueChange) 
+		? EBTDecoratorAbortRequest::ConditionPassing 
+		: EBTDecoratorAbortRequest::ConditionResultChanged;
+
+		ConditionalFlowAbort(*BehaviorComp, RequestMode);
+	}
+
+	return EBlackboardNotificationResult::ContinueObserving;
+}
+```
+
+```cpp
+void UBTDecorator::ConditionalFlowAbort(UBehaviorTreeComponent& OwnerComp, EBTDecoratorAbortRequest RequestMode) const
+{
+	const bool bIsExecutingBranch = OwnerComp.IsExecutingBranch(this, GetChildIndex());
+	const bool bPass = WrappedCanExecute(OwnerComp, NodeMemory);
+	const bool bAlwaysRequestWhenPassing = (RequestMode == EBTDecoratorAbortRequest::ConditionPassing);
+
+	if (bIsExecutingBranch != bPass)
+	{
+		OwnerComp.RequestExecution(this);
+	}
+	else if (bIsExecutingBranch && bPass && (bAlwaysRequestWhenPassing || bAbortPending))
+	{
+		// force result Aborted to restart from this decorator
+		OwnerComp.RequestExecution(GetParentNode(), InstanceIdx, this, GetChildIndex(), EBTNodeResult::Aborted);
+	}
+}
+```
+
+`bIsExecutingBranch`：表示该装饰器所在的子分支当前是否正在被执行。<br>
+例如，如果行为树正在运行该子节点（或其子树），则为 true；否则为 false。
+
+`bPass`：表示装饰器条件当前是否满足，`IsSet`是否为`true`
+
+```cpp
+if (bIsExecutingBranch != bPass)
+```
+这个 if 的含义是:
+
+|bIsExecutingBranch|bPass|相等|含义|
+|---|---|---|---|
+|false|true|yes|分支未执行，且条件不满足 → 正常，无需干预。|
+|false|true|no|分支未执行，但条件已满足 → 应该进入该分支。|
+|true|false|yes|分支正在执行，但条件不再满足 → 应该退出该分支。|
+|true|true|no|分支正在执行，且条件满足 → 正常，但 ValueChange 模式下仍可能因值变化而强制重启。|
+
+```cpp
+else if (bIsExecutingBranch && bPass && (bAlwaysRequestWhenPassing || bAbortPending))
+```
+这个 if 的含义是:<br>
+
+当前子分支在执行，并且`IsSet`或`IsNotSet`这样的条件满足，<br>
+但是多了一个`bAlwaysRequestWhenPassing`<br>
+如果`bAlwaysRequestWhenPassing`为true，就意味着目前模式是`ValueChange`.
+
+`ValueChange` 模式：装饰器检查 `距离 ≤ 600`，AI 正在攻击（分支执行），距离从 580 变为 590（仍 ≤600）。<br>
+此时 `bIsExecutingBranch = true`, `bPass = true`, `bAlwaysRequestWhenPassing = true`<br> 
+→ 条件成立 → 请求中止 → 行为树重启，攻击任务被中断，重新从分支开始执行（可能重新移动或攻击）。
+
+对比:<br>
+`ResultChange` 模式：同样场景，`bAlwaysRequestWhenPassing = false`，条件不成立 → 不会请求中止，攻击任务继续执行。
+
+---
+
+
+为什么 `CloseEnoughtoAttack` 会导致行为树每次 `DistToTarget` 变化时都从 `Sequence` 最左边的节点重新执行？
+
+当 `DistToTarget` 变化时（例如 590 → 580），装饰器请求中止当前分支。<br>
+父节点 `Sequence` 收到 `Aborted` 结果后，会重新评估所有子节点。<br>
+因此，`CanSeePlayer` 再次被检查，子节点A可能再次执行，然后才进入子节点B（攻击任务）。<br>
+结果：攻击任务被频繁中断，永远无法完成一次完整攻击。<br>
+
+---
+
+
+#### 服务
+
+行为树服务 节点旨在执行“后台”任务，更新 AI 的知识 <br>
+与任务不同，它们不返回任何结果，也不能直接影响执行流程。<br>
+
+ *  通常，服务会执行周期性的检查（参见 TickNode），并将结果存储在黑板中。
+ *  如果其下方的任何装饰器节点需要提前获得检查结果，请使用 `OnSearchStart` 函数。
+ *  请注意，在那里执行的任何检查都必须瞬时完成！
+
+另一个典型用例是在执行特定分支时创建标记（参见 `OnBecomeRelevant`、`OnCeaseRelevant`）,<br>
+通过在黑板中设置一个标志来实现。
+
+![](Meta/img1/Service_DistanceToTarget.png)
+
+服务节点 可以设置该节点Tick的间隔，决定每隔多久执行一次这个服务的Tick.
+
+```cpp
+void UBTService::ScheduleNextTick(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
+{
+	const float NextTickTime = FMath::FRandRange(FMath::Max(0.0f, Interval - RandomDeviation), (Interval + RandomDeviation));
+	SetNextTickTime(NodeMemory, NextTickTime);
+}
+
+void UBTAuxiliaryNode::SetNextTickTime(uint8* NodeMemory, float RemainingTime) const
+{
+	if (bTickIntervals)
+	{
+		FBTAuxiliaryMemory* AuxMemory = GetSpecialNodeMemory<FBTAuxiliaryMemory>(NodeMemory);
+
+		AuxMemory->NextTickRemainingTime = RemainingTime;
+	}
+}
+
+/*--------------------------*/
+bool UBTAuxiliaryNode::WrappedTickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds, float& NextNeededDeltaTime) const
+{
+	FBTAuxiliaryMemory* AuxMemory = GetSpecialNodeMemory<FBTAuxiliaryMemory>(NodeMemory);
+
+	AuxMemory->NextTickRemainingTime -= DeltaSeconds;
+	AuxMemory->AccumulatedDeltaTime += DeltaSeconds;
+
+	const bool bTick = AuxMemory->NextTickRemainingTime <= 0.0f;
+	if (bTick)
+	{
+		 UseDeltaTime = AuxMemory->AccumulatedDeltaTime;
+		 AuxMemory->AccumulatedDeltaTime = 0.0f;
+    
+		 const_cast<UBTAuxiliaryNode*>(NodeOb)->TickNode(OwnerComp, NodeMemory, UseDeltaTime);
+	}
+}
+```
+
+---
+
+
+## 网络
+
+### Windows网络
+
+
+接下来的两节 `客户端` 和 `服务端` 是一个用于测试的 `回显程序`，<br>
+客户端给服务端发送一个数据，服务端会把这个数据发回给客户端.
+
+#### 客户端
+
+
+[Winsocket 客户端代码](https://learn.microsoft.com/zh-cn/windows/win32/winsock/complete-client-code)
+
+客户端行为流程:
+```cpp
+[启动程序，附带参数 "127.0.0.1"]
+    ↓
+1. WSAStartup                        加载 Winsock 库
+    ↓
+2. getaddrinfo(argv[1], "27015")     解析服务器地址，返回地址链表
+    ↓
+3. 遍历地址链表
+   ├─ socket()                       尝试创建Socket
+   ├─ connect()                      尝试连接
+   └─ 若失败则继续下一个地址，直到成功或链表耗尽
+    ↓
+4. freeaddrinfo()                    释放地址链表
+    ↓
+5. send("this is a test")            发送测试数据
+    ↓
+6. shutdown(SD_SEND)                 关闭发送方向（告知服务器“我说完了”）
+    ↓
+7. do-while 循环 recv()              不断接收服务器回显，直到 recv 返回 0
+    ↓ (recv 返回 0)
+8. closesocket()                     关闭Socket
+    ↓
+9. WSACleanup()                      卸载 Winsock
+    ↓
+[程序退出]
+```
+
+---
+
+创建 WSAS:
+```cpp
+WSADATA wsaData;
+int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+WSACleanup();
+```
+
+`WSAStartup` 函数通过进程启动 `Winsock DLL` 的使用.<br>
+如果成功， `WSAStartup` 函数返回零.
+
+`MAKEWORD(2,2)` :调用方可以使用的最高版本的 Windows Socket规范。 
+高序字节指定次要版本号;低序字节指定主版本号。<br>
+
+应用程序或 DLL 只能在成功调用 `WSAStartup` 后发出进一步的 Windows Socket函数。
+
+`_WIN64` 的`WSAData`
+```cpp
+typedef struct WSAData 
+{
+	WORD            wVersion;
+    WORD            wHighVersion;
+
+    unsigned short  iMaxSockets;
+    unsigned short  iMaxUdpDg;
+    char FAR *      lpVendorInfo;
+
+    char            szDescription[WSADESCRIPTION_LEN+1];
+    char            szSystemStatus[WSASYS_STATUS_LEN+1];
+}
+```
+`wHighVersion` 成员指示 `Winsock DLL` 支持的 `Windows` Socket规范的最高版本。<br> 
+`wVersion` 成员指示 `Winsock DLL` 预期调用方使用的 `Windows` Socket规范的版本。
+
+`iMaxSockets` `iMaxUdpDg` `lpVendorInfo`  Socket2以及更高版本 应忽略这几个成员.
+
+使用完 `Winsock DLL` 的服务后，应用程序必须调用 `WSACleanup` ，<br>
+以允许 `Winsock DLL` 释放应用程序使用的内部 `Winsock` 资源。
+
+如果应用程序调用 `WSAStartup` 三次，则必须调用 `WSACleanup` 三次。 <br>
+`WSACleanup` 的前两个调用除了递减内部计数器外，什么都不做;<br>
+最终的 `WSACleanup` 调用会为 任务执行所需要的资源 解除分配。
+
+---
+
+`main` 的参数:
+
+```cpp
+int __cdecl main(int argc, char** argv)
+{
+	if (argc != 2) 
+	{
+   		printf("usage: %s server-name\n", argv[0]);
+		system("pause");
+    	return 1;
+	}
+}
+```
+
+`argc` 参数数量，`argv` 参数字符. <br>
+在CMD中运行 `Winsocket.exe 127.0.0.1`，<br>
+
+```
+argv[0]	= "Winsocket.exe" 
+argv[1]	= "127.0.0.1" 
+```
+
+
+`if (argc != 2)` 刚好输入了参数。<br>
+如果直接双击 `exe` 运行（`argc == 1`），会打印提示并退出，防止后续代码因 `argv[1]` 不存在而崩溃。
+
+双击 `exe` 运行，`argv[0]` 就是这个 `exe` 的路径地址.
+
+---
+
+连接端口:
+
+```cpp
+int getaddrinfo
+(
+	 // 主机名或 IP 地址字符串
+    const char* pNodeName,      
+
+	// 端口号或服务名（如 "http"）
+    const char* pServiceName,  
+
+	// 输入筛选条件
+    const struct addrinfo* pHints,
+
+	// 输出结果链表
+    struct addrinfo** ppResult    
+);
+```
+
+```cpp
+#define DEFAULT_PORT "27015"
+int __cdecl main(int argc, char** argv)
+{
+	struct addrinfo* result = nullptr;
+	struct addrinfo  hints;
+
+	ZeroMemory(&hints, sizeof(hints));
+
+	// 不限定 IPv4 还是 IPv6
+	hints.ai_family = AF_UNSPEC;
+
+	// 只要流式Socket（TCP）
+	hints.ai_socktype = SOCK_STREAM;
+
+	// 只要 TCP 协议
+	hints.ai_protocol = IPPROTO_TCP;
+
+	iResult = getaddrinfo(argv[1], DEFAULT_PORT, &hints, &result);
+	
+	if (iResult != 0)
+	{
+		printf("getaddrinfo failed with error: %d\n", iResult);
+		WSACleanup();
+		return 1;
+	}
+}
+```
+
+`getaddrinfo` 的第一个参数 `argv[1]` 就是参数中的 十进制IPv4地址 : `127.0.0.1` <br>
+`DEFAULT_PORT` 端口号.<br>
+
+第四个参数: `&result` <br>
+`getaddrinfo` 成功执行后，动态分配了一个 `addrinfo` 结构体链表，并将链表头指针存入 `result`。<br>
+链表中的每个节点代表一个可用的通信端点。
+
+
+`result`的用法:
+```cpp
+struct addrinfo 
+{
+    int              ai_flags;      // 标志位（如 AI_PASSIVE）
+
+    int              ai_family;     // 地址族（AF_INET 或 AF_INET6）
+    int              ai_socktype;   // SOCK_STREAM 等
+    int              ai_protocol;   // IPPROTO_TCP 等
+
+    size_t           ai_addrlen;    // 下面 ai_addr 指向的地址结构长度
+    struct sockaddr* ai_addr;       // 指向已填充好的 sockaddr 结构（包含 IP 和端口）
+
+    char*            ai_canonname;  // 规范主机名（一般不用）
+    struct addrinfo* ai_next;       // 指向链表下一个节点
+};
+```
+
+在示例代码中的使用: `for` 遍历每个节点， 链表里可能有一个或两个节点.
+
+一台主机可能有多个 IP 地址（多网卡，或同时支持 IPv4/IPv6），客户端不一定知道服务端支持哪种。<br>
+遍历链表逐个尝试，哪个先连通就用哪个.
+
+代码如下:
+```cpp
+
+SOCKET ConnectSocket = INVALID_SOCKET;
+for (ptr = result; ptr != NULL; ptr = ptr->ai_next) 
+{
+    // 直接用当前节点的 协议族、类型、协议 创建Socket
+    ConnectSocket = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+
+	// 如果创建失败，直接退出.
+	if (ConnectSocket == INVALID_SOCKET) 
+	{
+    	printf("socket failed with error: %ld\n", WSAGetLastError());
+    	WSACleanup();
+    	return 1;
+	}
+
+    // 直接用当前节点的地址结构和长度去 connect
+    iResult = connect(ConnectSocket, ptr->ai_addr, (int)ptr->ai_addrlen);
+
+	// 如果失败 继续尝试连接下一个节点.
+	if (iResult == SOCKET_ERROR) 
+	{
+    	closesocket(ConnectSocket);
+    	ConnectSocket = INVALID_SOCKET;
+    	continue;
+	}
+
+	// 到达这一步就意味着没有失败，可以停止循环.
+	break;
+}
+
+freeaddrinfo(result);
+```
+`ConnectSocket == INVALID_SOCKET`: <br>
+如果连一个空的Socket结构都创建不出来，说明当前系统环境已经不具备运行网络程序的基本条件，<br>
+可能有系统故障，因此，立即报错退出是最稳妥的做法。
+
+`freeaddrinfo(result)` 释放链表.
+
+---
+
+连接上了，开始发送消息:
+
+```cpp
+
+SOCKET ConnectSocket;
+
+const char* sendbuf = "this is a test XXXX";
+
+iResult = send(ConnectSocket, sendbuf, (int)strlen(sendbuf), 0);
+
+if (iResult == SOCKET_ERROR) 
+{
+    printf("send failed with error: %d\n", WSAGetLastError());
+    closesocket(ConnectSocket);
+    WSACleanup();
+    return 1;
+}
+```
+如果未发生错误， `send` 将返回发送的总字节数，该字节数可能小于 在 len 参数中请求发送的字节数。 <br>
+否则，将返回 `SOCKET_ERROR`，并且可以通过调用 `WSAGetLastError` 来检索特定的错误代码。
+
+---
+
+关闭连接:
+
+```cpp
+ // shutdown the connection since no more data will be sent
+ iResult = shutdown(ConnectSocket, SD_SEND);
+
+ if (iResult == SOCKET_ERROR) {
+     printf("shutdown failed with error: %d\n", WSAGetLastError());
+     closesocket(ConnectSocket);
+     WSACleanup();
+     return 1;
+ }
+ ```
+
+`SD_RECEIVE` 关闭接收操作.<br>
+`SD_SEND` 关闭发送操作.<br>
+`SD_BOTH` 关闭发送和接收操作.
+
+如果未发生错误， `shutdown` 将返回零。
+
+---
+
+接收消息:<br>
+```cpp
+// Receive until the peer closes the connection
+do {
+    iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
+    if (iResult > 0)
+        printf("Bytes received: %d\n", iResult);
+    else if (iResult == 0)
+        printf("Connection closed\n");
+    else
+        printf("recv failed with error: %d\n", WSAGetLastError());
+} while (iResult > 0);
+```
+
+不断接收服务器发来的数据，直到连接被对端关闭为止.
+
+如果未发生错误， `recv` 将返回收到的字节数， `buf` 参数指向的缓冲区将包含接收的此数据。 <br>
+如果连接已正常关闭，则返回值为零。
+
+如果服务器没有给客户端发数据，`recv`会一直阻塞，直到超时或被强制中止.
+
+关闭阻塞模式:<br>
+设置Socket I/O 模式：本例中使用 `FIONBIO` <br>
+根据 `iMode` 的数值来启用或禁用Socket的阻塞模式。<br>
+若 `iMode = 0`，启用阻塞模式；<br>
+若 `iMode != 0`，启用非阻塞模式。<br>
+
+```cpp
+SOCKET m_socket;
+m_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+iResult = ioctlsocket(m_socket, FIONBIO, &iMode);
+if (iResult != NO_ERROR)
+{ 
+	printf("ioctlsocket 失败，错误码：%ld\n", iResult);
+}
+```
+
+---
+
+#### 服务端
+
+[WinSocket 服务端代码](https://learn.microsoft.com/zh-cn/windows/win32/winsock/complete-server-code)
+
+服务端流程:
+
+```
+[WSAStartup]
+     ↓
+[getaddrinfo] → 获取 0.0.0.0:27015 的绑定地址
+     ↓
+[socket] → 创建监听Socket
+     ↓
+[bind] → 绑定端口
+     ↓
+[listen] → 进入 LISTEN 状态
+     ↓
+[accept] → 阻塞等待客户端连接
+     ↓ (客户端 connect)
+[accept 返回] → 创建 ClientSocket
+     ↓
+[closesocket 监听Socket] (不再接受新连接) 
+     ↓
+┌─────────────────────────┐
+│  do-while 接收/回显循环  │
+│  - recv 阻塞等待数据      │
+│  - send 回显数据          │
+└─────────────────────────┘
+     ↓ (recv 返回 0)
+[shutdown(SD_SEND)] → 发送 FIN
+     ↓
+[closesocket ClientSocket] → 完全释放
+     ↓
+[WSACleanup]
+     ↓
+   退出
+```
+
+---
+
+初始化 :
+```cpp
+#define DEFAULT_BUFLEN 512
+#define DEFAULT_PORT "27015"
+
+void main()
+{
+	SOCKET ListenSocket = INVALID_SOCKET;
+	SOCKET ClientSocket = INVALID_SOCKET;
+
+	ZeroMemory(&hints, sizeof(hints));
+	// 仅 IPv4
+	hints.ai_family = AF_INET;
+	
+	// TCP 流式Socket
+	hints.ai_socktype = SOCK_STREAM;
+	
+	// TCP 协议
+	hints.ai_protocol = IPPROTO_TCP;
+	
+	// 关键：用于被动监听
+	hints.ai_flags = AI_PASSIVE;
+
+	// Resolve the server address and port
+	getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
+
+	ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+
+	// 将 Socket 与 0.0.0.0:27015 绑定
+	// 发往本机 27015 端口的 TCP SYN 包应当交给这个 Socket 处理。
+	bind(ListenSocket, result->ai_addr, (int)result->ai_addrlen);
+	freeaddrinfo(result);
+
+	//将 Socket 从 CLOSED 状态转为 LISTEN 状态
+	listen(ListenSocket, SOMAXCONN);
+}
+```
+
+接收客户端连接:
+```cpp
+void main()
+{
+	//....//
+
+	//ListenSocket 仅用于接受新连接，后续的数据传输完全由 ClientSocket 负责
+	ClientSocket = accept(ListenSocket, NULL, NULL);
+
+	// 此示例中，服务端只服务一个客户端，因此立即关闭监听Socket，不再接受其他连接。
+	closesocket(ListenSocket);
+}
+```
+
+`accetp` 会阻塞程序，直到有一个客户端连接该服务端，服务端才会创建`ClientSocket`.<br>
+之后 服务端继续往下执行，运行到 `closesocket(ListenSocket)`，关闭 `ListenSocket`.<br>
+
+
+数据接收 :
+
+```cpp
+#define DEFAULT_BUFLEN 512
+
+int iSendResult;
+char recvbuf[DEFAULT_BUFLEN];
+int recvbuflen = DEFAULT_BUFLEN;
+
+do 
+{
+    iResult = recv(ClientSocket, recvbuf, recvbuflen, 0);
+    if (iResult > 0) 
+	{
+        // 收到数据，原样发回
+        send(ClientSocket, recvbuf, iResult, 0);
+    }
+    else if (iResult == 0) 
+	{
+        // 客户端关闭了发送方向
+        printf("Connection closing...\n");
+    }
+    else 
+	{
+        // 接收错误，如连接重置
+    }
+} while (iResult > 0);
+```
+
+---
+
+
+#### IOCP
+
+这一节不重要.
+
+[IOCP 服务端与客户端的代码](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/Win7Samples/netds/winsock/iocp)
+
+依然是一个用于测试的 `回显程序`，客户端给服务端发送一个数据，服务端会把这个数据发回给客户端.
+
+基本思想是：服务器持续接受来自客户端程序的连接请求。<br>
+每当接受一个新连接时，<br>
+该已接受的 `Socket` 描述符会被添加到现有的 `IOCP` 中，并且会针对该 `Socket` 投递一个初始的接收操作（`WSARecv`）。<br>
+
+当客户端随后在该 `Socket` 上发送数据时,一个 `I/O` 包将被递送，并由服务器的一个工作线程处理。<br>
+工作线程通过投递一个 包含所有刚刚接收到的数据 的发送操作（`WSASend`），将数据回传给发送方。<br>
+
+当数据回传完成时，另一个 `I/O` 包将被递送，并再次由一个工作线程处理。<br>
+
+假设所有需要发送的数据均已实际发出，则会再次投递一个新的接收操作（`WSARecv`），<br>
+如此循环往复，直到客户端停止发送数据。
+
+---
+
+在实际游戏服务器中，工作线程绝不会简单地把数据发回去。<br>
+它会做以下内容：<br>
+将收到的字节流反序列化成游戏消息（比如 `PlayerMove`、`FireWeapon`）。<br>
+把消息派发给对应的游戏逻辑模块。<br>
+游戏逻辑处理完毕后，可能会生成新的数据（比如广播其他玩家的位置），再通过 `WSASend` 发送给相关客户端。<br>
+
+---
+
+##### 客户端
+
+这个控制台程序绑定了控制台的 `Ctrl+C` 事件，在控制台中按下`Ctrl+C`可以终止控制台程序.<br>
+
+下面大概就是它的用法 :
+```cpp
+static WSAEVENT g_hCleanupEvent[1];
+
+int __cdecl main(int argc, char *argv[]) 
+{
+	g_hCleanupEvent[0] = WSACreateEvent();
+
+	if( !SetConsoleCtrlHandler (CtrlHandler, TRUE) ) 
+	{
+		myprintf("SetConsoleCtrlHandler() failed: %d\n", GetLastError());
+		if( g_hCleanupEvent[0] != WSA_INVALID_EVENT ) 
+		{
+			WSACloseEvent(g_hCleanupEvent[0]);
+			g_hCleanupEvent[0] = WSA_INVALID_EVENT;
+		}
+		WSACleanup();
+		return(1);
+	}
+
+	/*... */
+	WaitForMultipleObjects(g_Options.nTotalThreads, g_ThreadInfo.hThread, TRUE, INFINITE);
+
+	if( !GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) ) 
+	{
+		myprintf("GenerateConsoleCtrlEvent() failed: %d\n", GetLastError());
+	};
+
+	if( WSAWaitForMultipleEvents(1, g_hCleanupEvent, TRUE, WSA_INFINITE, FALSE) == WSA_WAIT_FAILED ) 
+	{
+		myprintf("WSAWaitForMultipleEvents() failed: %d\n", WSAGetLastError());
+	};
+}
+
+static BOOL WINAPI CtrlHandler (DWORD dwEvent) 
+{
+	/* 清理其他内容 */
+	WSASetEvent(g_hCleanupEvent[0]);
+	return(TRUE);
+}
+```
+`WaitForMultipleObjects` 等待这些线程结束.<br>
+
+`GenerateConsoleCtrlEvent` 主线程主动向自己发送 `Ctrl+C` 信号，以触发 `CtrlHandler` 执行清理.
+
+`WSAWaitForMultipleEvents` 函数确定是否满足等待条件。 <br>
+如果未满足条件，调用线程将进入等待状态。
+
+在程序结束前 记得关闭这个Event.
+```cpp
+WSACloseEvent(g_hCleanupEvent[0]);
+```
+
+微软文档是这样描述的:
+```
+WSAWaitForMultipleEvents 函数确定是否满足等待条件。 
+如果未满足条件，调用线程将进入等待状态。 它在等待满足条件时不使用处理器时间。
+```
+如果它不使用CPU，那就意味着不是轮询，而是由外部触发，由 `Windows` 内核来唤醒.
+
+
+---
+
+```cpp
+struct OPTIONS
+{
+	char szHostname[64];
+	char* port;
+	int nTotalThreads;
+	int nBufSize;
+	BOOL bVerbose;
+};
+
+static OPTIONS default_options = {"localhost", "5001", 1, 4096, FALSE};
+static OPTIONS g_Options;
+
+int __cdecl main(int argc, char *argv[]) 
+{
+	ValidOptions(argv, argc);
+
+	for( i = 0; i < g_Options.nTotalThreads && !bInitError; i++ ) 
+	{
+		if(CreateConnectedSocket(i))
+		{
+			nThreadNum[i] = i;
+			g_ThreadInfo.hThread[i] = CreateThread(NULL, 0, 
+			EchoThread, (LPVOID)&nThreadNum[i], 0, &dwThreadId);
+		}
+	}
+}
+
+static BOOL ValidOptions(char *argv[], int argc) 
+{
+	g_Options = default_options;
+}
+```
+`nThreadNum` 是每个线程的编号，每个线程都执行 `EchoThread` 函数参数就是线程编号.<br>
+
+`CreateConnectedSocket` 为每个线程创建一个 `Socket` ，保存在全局变量 `g_ThreadInfo.sd` 中.
+```cpp
+static BOOL CreateConnectedSocket(int nThreadNum) 
+{
+    // 1. 解析服务器地址（使用全局配置中的主机名和端口）
+    getaddrinfo(g_Options.szHostname, g_Options.port, &hints, &addr_srv);
+
+    // 2. 创建 TCP Socket
+    g_ThreadInfo.sd[nThreadNum] = socket(addr_srv->ai_family, addr_srv->ai_socktype, addr_srv->ai_protocol);
+
+    // 3. 连接到服务器
+    connect(g_ThreadInfo.sd[nThreadNum], addr_srv->ai_addr, (int)addr_srv->ai_addrlen);
+
+    // 4. 打印连接成功信息
+    myprintf("connected(thread %d)\n", nThreadNum);
+}
+```
+
+---
+
+接下来要创建线程 :
+
+经过 `ValidOptions` 函数之后:g_Options 的参数:
+```cpp
+char szHostname[64] = "localhost";
+char* port = "5001";
+int nTotalThreads = 1;
+int nBufSize = 4096;
+BOOL bVerbose = FALSE;
+```
+
+这些线程会执行下面这个函数:
+
+```cpp
+#define xmalloc(s) HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,(s))
+#define xfree(p)   {HeapFree(GetProcessHeap(),0,(p)); p = NULL;}
+
+static DWORD WINAPI EchoThread(LPVOID lpParameter) 
+{
+	char *inbuf  = NULL;
+	char *outbuf = NULL;
+
+	inbuf = (char *)xmalloc(g_Options.nBufSize);
+	outbuf = (char *)xmalloc(g_Options.nBufSize);
+
+	int *pArg = (int *)lpParameter;
+	int nThreadNum = *pArg;
+
+	if( (inbuf) && (outbuf)) 
+	{
+		FillMemory(outbuf, g_Options.nBufSize, (BYTE)nThreadNum);
+
+		while( TRUE ) 
+		{
+			if( SendBuffer(nThreadNum, outbuf) && RecvBuffer(nThreadNum, inbuf) ) 
+			/*...*/
+		}
+	}
+}
+```
+发送和接收消息:
+```cpp
+if( SendBuffer(nThreadNum, outbuf) && RecvBuffer(nThreadNum, inbuf) )
+{
+	if( (inbuf[0] == outbuf[0]) 
+	&& (inbuf[g_Options.nBufSize-1] == outbuf[g_Options.nBufSize-1]) ) 
+	{
+		if( g_Options.bVerbose )
+		{
+			myprintf("ack(%d)\n", nThreadNum);
+		}
+	} 
+}
+```
+只有 `SendBuffer` 返回 `true` 之后，才会调用 `RecvBuffer`.<br>
+而在这个工程中 没有设置非阻塞，所以 if会一直阻塞在 `SendBuffer`内部的`send`函数，直到它返回.
+
+当if的判断条件为true时，就意味着 发送成功 并且 接收成功.
+
+---
+
+真·发送消息 <br>
+前面已经为每个线程创建了 `Socket` 以及线程，接下来要真正联动它们.
+
+```cpp
+static BOOL SendBuffer(int nThreadNum, char *outbuf)
+{
+	BOOL bRet = TRUE;
+	char *bufp = outbuf;
+	int nTotalSend = 0;
+	int nSend = 0;
+
+	while( nTotalSend < g_Options.nBufSize ) 
+	{
+		nSend = send(g_ThreadInfo.sd[nThreadNum], bufp, g_Options.nBufSize - nTotalSend, 0);
+
+		if (nSend != SOCKET_ERROR && nSend!= 0)
+		{
+			nTotalSend += nSend;
+			bufp += nSend;
+		}
+	}
+
+	return(bRet);
+}
+```
+如果发送的长度小于全局定义的 `nBufSize` 就一直发送，直到发送出指定长度的消息 这个函数才会结束.
+
+要发送的目标 `Socket` 是根据线程ID 从全局 `Socket` 中获取的.
+
+这样一来，线程就和对应的 `Socket` 联系起来了.
+
+---
+
+##### 服务端
+
+总览:
+```cpp
+[初始化]
+    │
+    ├─ g_hIOCP ────────────────────────────────→ [关闭] CloseHandle
+    │
+    ├─ 监听Socket g_sdListen ───────────────→ Ctrl+C 时关闭，或 finally 中关闭
+    │
+    ├─ 工作线程池 ──────────────────────────→ PostQueuedCompletionStatus 唤醒并退出
+    │
+    └─ 全局上下文链表 g_pCtxtList ────────→ CtxtListFree() 遍历释放
+
+[每次客户端连接]
+    │
+    ├─ WSAAccept 返回新Socket sdAccept
+    │
+    ├─ 分配 PER_SOCKET_CONTEXT 和 PER_IO_CONTEXT
+    │
+    ├─ 将 sdAccept 绑定到 g_hIOCP（CompletionKey = Socket上下文）
+    │
+    ├─ 加入全局链表
+    │
+    └─ 投递第一个 WSARecv
+
+[每个 I/O 完成]
+    │
+    ├─ GetQueuedCompletionStatus 返回 CompletionKey 和 Overlapped
+    │
+    ├─ 通过 Overlapped 定位 PER_IO_CONTEXT
+    │
+    ├─ 根据 IOOperation 执行状态转换（Read → Write → Read ...）
+    │
+    └─ 投递下一个 WSASend 或 WSARecv，Overlapped 结构复用
+```
+
+初始化阶段:
+```cpp
+main()
+  │
+  ├─ GetSystemInfo() → 获取 CPU 核心数，计算工作线程数 = 核心数 × 2
+  │
+  ├─ WSAStartup() → 加载 Winsock 2.2
+  │
+  ├─ InitializeCriticalSection() → 初始化全局临界区
+  │
+  ├─ CreateIoCompletionPort(INVALID_HANDLE_VALUE, ...) → 创建全局 IOCP 句柄 g_hIOCP
+  │
+  ├─ for (i = 0; i < 工作线程数; i++)
+  │     CreateThread(WorkerThread, g_hIOCP) → 创建工作线程池
+  │
+  └─ CreateListenSocket()
+        ├─ getaddrinfo(NULL, port, AI_PASSIVE) → 获取 0.0.0.0 绑定地址
+        ├─ WSASocket(..., WSA_FLAG_OVERLAPPED) → 创建重叠 I/O 监听Socket
+        ├─ bind() → 绑定端口
+        ├─ listen() → 开始监听
+        └─ setsockopt(SO_SNDBUF, 0) → 禁用发送缓冲区（可选优化）
+```
+
+主线程服务循环:
+```cpp
+while (TRUE)
+  │
+  ├─ sdAccept = WSAAccept(g_sdListen, ...)   ← 阻塞等待客户端连接
+  │     │
+  │     └─ 若失败（Ctrl+C 关闭了监听Socket）→ 跳出循环
+  │
+  ├─ UpdateCompletionPort(sdAccept, ClientIoRead, TRUE)
+  │     ├─ CtxtAllocate() → 分配 PER_SOCKET_CONTEXT 和 PER_IO_CONTEXT
+  │     ├─ CreateIoCompletionPort(sdAccept, g_hIOCP, lpPerSocketContext, 0)
+  │     │    → 将新Socket绑定到 IOCP，CompletionKey = Socket上下文
+  │     └─ CtxtListAddTo() → 将上下文加入全局链表（用于后续清理）
+  │
+  ├─ 检查 g_bEndServer → 若为 TRUE 则跳出循环
+  │
+  └─ WSARecv(sdAccept, &lpIOContext->wsabuf, 1, ..., &lpIOContext->Overlapped, NULL)
+        → 投递初始异步接收请求，立即返回（通常返回 WSA_IO_PENDING）
+```
+
+工作线程状态机:
+```cpp
+WorkerThread(hIOCP)
+  │
+  └─ while (TRUE)
+        │
+        ├─ GetQueuedCompletionStatus(hIOCP, &dwIoSize, &lpPerSocketContext, &lpOverlapped, INFINITE)
+        │      ← 无完成包时睡眠（0% CPU），有完成包时被内核唤醒
+        │
+        ├─ 若 lpPerSocketContext == NULL → return 0   （退出信号）
+        │
+        ├─ 若 g_bEndServer == TRUE → return 0
+        │
+        ├─ 若 dwIoSize == 0（连接断开）→ CloseClient() → continue
+        │
+        └─ lpIOContext = (PPER_IO_CONTEXT)lpOverlapped
+           │
+           └─ switch (lpIOContext->IOOperation)
+                 │
+                 ├─ case ClientIoRead ──────────────────────────┐
+                 │      │                                        │
+                 │      ├─ lpIOContext->IOOperation = ClientIoWrite
+                 │      ├─ lpIOContext->nTotalBytes = dwIoSize   │
+                 │      ├─ lpIOContext->wsabuf.len = dwIoSize    │
+                 │      │                                        │
+                 │      └─ WSASend(..., &lpIOContext->Overlapped)│
+                 │           → 投递异步发送（回显数据）            │
+                 │                                              │
+                 └─ case ClientIoWrite ─────────────────────────┤
+                        │                                       │
+                        ├─ lpIOContext->nSentBytes += dwIoSize  │
+                        │                                       │
+                        ├─ if (nSentBytes < nTotalBytes)        │
+                        │      └─ WSASend(剩余部分) → 继续发送    │
+                        │                                       │
+                        └─ else                                │
+                               ├─ lpIOContext->IOOperation = ClientIoRead
+                               └─ WSARecv(...) → 投递下一个接收请求
+                                                              │
+                                                              │
+   ┌──────────────────────────────────────────────────────────┘
+   │
+   └─→ 回到 GetQueuedCompletionStatus，等待下一个完成包
+```
+
+关闭与清理阶段:
+```cpp
+用户按下 Ctrl+C
+        │
+        ▼
+CtrlHandler(CTRL_C_EVENT)  [系统独立线程中执行]
+        │
+        ├─ g_bRestart = FALSE / TRUE （根据 Ctrl+C 或 Ctrl+Break）
+        ├─ 保存 g_sdListen 到局部变量 sockTemp
+        ├─ g_sdListen = INVALID_SOCKET
+        ├─ g_bEndServer = TRUE
+        └─ closesocket(sockTemp)  → 导致主线程 WSAAccept 失败
+
+同时，主线程 WSAAccept 返回 SOCKET_ERROR，跳出 while 循环
+        │
+        ▼
+main() 进入 __finally 块
+        │
+        ├─ g_bEndServer = TRUE
+        │
+        ├─ for (i = 0; i < 工作线程数; i++)
+        │      PostQueuedCompletionStatus(g_hIOCP, 0, 0, NULL)
+        │        → 向 IOCP 投递 N 个特殊完成包（CompletionKey = NULL）
+        │
+        ├─ WaitForMultipleObjects(所有工作线程句柄) → 等待工作线程全部退出
+        │      │
+        │      └─ 工作线程收到 CompletionKey == NULL 后 return 0
+        │
+        ├─ CtxtListFree()
+        │      └─ 遍历全局上下文链表，对每个客户端Socket执行：
+        │            setsockopt(SO_LINGER, l_linger=0) → 强制关闭
+        │            closesocket()
+        │            xfree() 释放上下文内存
+        │
+        ├─ CloseHandle(g_hIOCP)
+        ├─ closesocket(g_sdListen)（若尚未关闭）
+        └─ DeleteCriticalSection() → WSACleanup()
+
+        ▼
+    进程退出（或根据 g_bRestart 标志重启服务循环）
+```
+
+---
+
+#### TCP/UDP
+
+可靠性和次序性是区分 TCP 与 UDP 最核心的两个维度.
+
+**TCP：可靠、有序的字节流**
+
+可靠性:<br>
+1.确认与重传：接收方每收到数据就回送 ACK，发送方若超时未收到 ACK 则自动重传。<br>
+2.校验和：头部和数据都有校验，出错则丢弃并重传。<br>
+3.流量控制：滑动窗口机制防止发送方淹没接收方。<br>
+
+`send()` 返回成功即代表数据已进入内核发送缓冲区，TCP 协议栈会负责最终送达。无需自己处理丢包。
+
+次序性:<br>
+序列号：每个字节都有唯一的 32 位序列号。<br>
+接收方按序列号重新排序后再交付给应用层，保证 `recv()` 读到的顺序与 `send()` 写入的顺序完全一致。
+
+代价：建立连接需三次握手，断开需四次挥手，头部开销 20 字节，传输延迟略高。
+
+**UDP：不可靠、保留边界的报文**
+
+可靠性: 无任何保证。<br>
+UDP 发送后即遗忘，不等待确认，不重传。数据报可能在网络任意节点丢失。<br>
+`sendto()` 成功仅代表数据报进入了本地网络队列，不代表对方收到。
+
+次序性: 不保证顺序。<br>
+每个数据报独立路由，后发的可能先到。<br>
+连续两次 `sendto`，对方可能先收到第二个包，再收到第一个包，甚至只收到其中一个。
+
+收益：无连接建立延迟，头部仅 8 字节，传输效率高，适合实时性优先的场景。
+
+---
+
+**连接与关闭**
+
+`从容关闭`
+
+|特性|TCP|UDP|
+|---|---|---|
+|连接状态|有连接，需维护双方状态|无连接，无状态|
+|关闭过程|必须通过四次挥手协商关闭，确保数据完整性|无需任何关闭动作，随时可停止收发|
+|半关闭|支持 shutdown(SD_SEND)，一方可先停止发送但仍能接收|无此概念|
+
+`从容关闭` 走完四次挥手，确保数据被确认，发送缓冲区的数据尽量发送完毕.<br>
+依赖 `TCP` 的状态机和四次挥手协议。<br>
+UDP Socket 调用 `closesocket` 时，只是释放本地端口和资源，不会向对端发送任何通知，对端完全不知道你已关闭。<br>
+因此，UDP 不存在“从容”或“强制”关闭的区别——关闭就是关闭，无协议交互。
+
+`强制关闭` 不走完整四次挥手，立即中断连接，,发送缓冲区的数据全部丢弃.
+
+
+---
+
+#### I/O模型
+
+**阻塞模型**<br>
+
+调用 `recv / send / accept` 时，若操作无法立即完成，线程会挂起睡眠，直到操作完成或出错才返回。
+
+优点:<br>
+代码简单，逻辑清晰;适合单连接、短任务场景.<br>
+
+缺点:<br>
+一个线程只能处理一个连接；等待时完全占用线程资源,无法同时处理多个连接
+
+适用：简单工具、教学示例、单连接文件传输.
+
+---
+
+**非阻塞模型**
+
+通过 `ioctlsocket(sock, FIONBIO, &mode)` 将Socket设为非阻塞。<br>
+调用 `recv` 若无数据，立即返回错误码 `WSAEWOULDBLOCK`，线程继续执行.
+
+```cpp
+// If iMode = 0, blocking is enabled; 
+// If iMode != 0, non-blocking mode is enabled.
+
+u_long iMode = 1;
+ioctlsocket(sock, FIONBIO, &iMode);
+int len = recv(sock, buf, size, 0);
+if (len == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) 
+{
+    // 暂无数据，做别的事
+}
+```
+
+优点:<br>
+单个线程可管理多个Socket（轮询）;不会阻塞线程.
+
+缺点:<br>
+需要不断循环检查所有Socket，忙等待浪费 CPU; 代码复杂，需处理部分发送/接收.
+
+适用：对延迟要求极高、且连接数不多时的手动优化场景（实际较少单独使用）.
+
+---
+
+**select 模型**
+
+将多个Socket放入一个集合，调用 `select` 阻塞等待，直到任一Socket变为 `可读/可写/异常`。<br>
+返回后遍历集合找出就绪的Socket处理。
+
+```cpp
+fd_set readfds;
+FD_ZERO(&readfds);
+FD_SET(sock1, &readfds);
+FD_SET(sock2, &readfds);
+select(0, &readfds, NULL, NULL, NULL);  // 阻塞等待任意Socket可读
+for (int i = 0; i < numsocks; i++) 
+{
+    if (FD_ISSET(socks[i], &readfds)) 
+	{
+        recv(socks[i], ...);
+    }
+}
+```
+
+`fd_set` 结构由各种 `Windows` Socket函数和服务提供程序（如 select 函数）用于将Socket放入“集”中以实现各种目的，<br>
+例如使用 `select` 函数的 `readfds` 参数测试给定Socket的可读性。
+
+`FD_SET` 宏将描述符添加到`fd_set`.
+
+`FD_ISSET`:<br>
+```cpp
+#define FD_ISSET(fd, set) __WSAFDIsSet((SOCKET)(fd), (fd_set FAR *)(set))
+```
+`__WSAFDIsSet` 函数返回一个值，该值指示 `Socket` 是否包含在一组 Socket描述符 中。
+
+所以 下面这一行就是在询问 `Socket`在不在可读列表里 ，<br>
+如果可读 就使用`recv`接收这个`Socket`的数据:
+```cpp
+if (FD_ISSET(socks[i], &readfds)) 
+{
+    recv(socks[i], ...);
+}
+```
+
+优点:<br>
+单线程同时管理多个连接 ; 解决了一连接一线程的资源浪费.
+
+缺点:<br>
+每次调用需将集合从用户态拷贝到内核态；返回后需遍历所有Socket（O(n)）.<br>
+有最大Socket数限制 (Windows 默认 64，可修改但性能下降).
+
+---
+
+**WSAEventSelect 模型**
+
+
+将 `Socket` 与一个 `Windows` 事件对象（WSAEVENT）关联。<br>
+当网络事件发生时，事件变为 `有信号`. <br>
+线程通过 `WSAWaitForMultipleEvents` 等待多个事件。
+
+```cpp
+WSAEVENT hEvent = WSACreateEvent();
+WSAEventSelect(sock, hEvent, FD_READ | FD_CLOSE);
+WSAWaitForMultipleEvents(1, &hEvent, FALSE, WSA_INFINITE, FALSE);
+
+// 事件触发后，枚举具体事件并处理
+WSANETWORKEVENTS netEvents;
+WSAEnumNetworkEvents(sock, hEvent, &netEvents);
+if (netEvents.lNetworkEvents & FD_READ) 
+{
+	 recv(...); 
+}
+```
+
+`WSAEventSelect` 函数指定 要与指定的 `FD_XXX` 网络事件集关联 的事件对象.
+
+`WSAEnumNetworkEvents` 函数可发现所指示 `Socket` 的网络事件、清除内部网络事件记录以及重置事件对象 (可选) 。
+
+优点:<br>
+无需窗口，纯后台服务可用;一个线程可等待最多 64 个事件（WSA_MAXIMUM_WAIT_EVENTS）.
+
+缺点:<br>
+每个套接字需要一个事件对象，大量连接时事件数组管理复杂;<br>
+仍需轮询事件数组，扩展性有限.
+
+---
+
+**重叠 I/O 模型**
+
+调用 `WSARecv / WSASend` 时传入一个 `WSAOVERLAPPED` 结构，函数立即返回（通常返回 `WSA_IO_PENDING`）。<br>
+
+完成时，系统可通过以下方式通知：<br>
+事件通知：`WSAOVERLAPPED.hEvent` 变为有信号。<br>
+完成例程：传递一个回调函数，在 I/O 完成时被 APC 调用。<br>
+
+```cpp
+WSAOVERLAPPED overlapped = {0};
+overlapped.hEvent = WSACreateEvent();
+
+// 立即返回
+WSARecv(sock, &buf, 1, &bytes, &flags, &overlapped, NULL);
+
+// 等待完成
+WSAWaitForMultipleEvents(1, &overlapped.hEvent, ...);       
+
+WSAGetOverlappedResult(sock, &overlapped, &bytes, FALSE, &flags);
+```
+
+优点:<br>
+真正异步，不阻塞调用线程;可同时投递多个 I/O 请求.
+
+
+缺点:<br>
+仅基于事件时，仍需一个事件对象 per I/O 操作.<br>
+完成例程（APC）需要线程处于可警告状态（SleepEx / WaitForSingleObjectEx），容易出错。<br>
+
+---
+
+**IOCP 模型**
+
+I/O 完成端口（IOCP） 是 `Windows` 操作系统提供的一种高性能异步 I/O 模型。<br>
+它解决一个核心问题：如何让一个 服务端程序 同时高效处理成千上万个网络连接，而不会卡死或占用过多 CPU？
+
+在传统的阻塞模型 或 `select` 模型中，随着连接数增加，要么线程数量爆炸，要么轮询效率骤降。<br>
+`IOCP` 通过内核级别的完成通知队列和固定数量的线程池，实现了真正的异步 I/O 和线性扩展。
+
+---
+
+```cpp
+HANDLE hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+```
+`IOCP` 的核心对象，由内核维护一个完成包队列.<br>
+所有绑定到该 `IOCP` 的 `Socket`，其上发生的异步 I/O 操作完成时，都会向该队列投递一个完成包.
+
+绑定 `IOCP` 和 `Socket`:
+```cpp
+CreateIoCompletionPort((HANDLE)socket, hIOCP, (ULONG_PTR)lpPerSocketContext, 0);
+```
+
+---
+
+### Unreal网络
+
+虚幻网络在Socket的基础上进行了一些封装，了解前面的Windows网络之后 就能看明白这里的内容了.
+
+这一块的分析思路是 按照源文件中的注释去分析代码.
+
+```cpp
+/**
+ * This is the base interface to abstract platform specific sockets API
+ * differences.
+ */
+class ISocketSubsystem
+
+/**
+ * Standard BSD specific socket subsystem implementation
+ */
+class FSocketSubsystemBSD : public ISocketSubsystem
+
+/**
+ * Windows specific socket subsystem implementation.
+ */
+class FSocketSubsystemWindows
+	: public FSocketSubsystemBSD
+```
+各平台的 `Socket` 接口继承自 `FSocketSubsystemBSD`:
+
+![](Meta/img2/SocketBSD_Class.png)
+
+`Windows`网络接口位于:
+```
+Source/Runtime/Sockets/Private/Windows/
+```
+
+虚幻网络架构 :
+```cpp
+┌─────────────────────────────────────────────────────────────┐
+│                      游戏逻辑层                              │
+│  AActor::ReplicateSubobject / UFUNCTION(Server, Client)     │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                   对象复制与 RPC 层                          │
+│  UChannel / UActorChannel / UVoiceChannel / UControlChannel │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                      连接管理层                              │
+│  UNetConnection / UIpConnection / UChildConnection          │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     网络驱动层                               │
+│  UNetDriver / UIpNetDriver / UDemoNetDriver                 │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                  平台Socket抽象层                            │
+│  ISocketSubsystem / FSocket / FSocketSubsystemWindows       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### NetDriver
+
+以下内容来自 NetDriver 的头文件注释.
+
+```
+/**
+ *****************************************************************************************
+ * NetDrivers、NetConnections 和 Channels
+ *****************************************************************************************
+ *
+ * UNetDriver 负责管理一组 UNetConnection，以及它们之间可共享的数据。
+ * 对于给定的游戏，通常只有相对较少的 UNetDriver。可能包括：
+ *	- Game NetDriver，负责标准的游戏网络流量。
+ *	- Demo NetDriver，负责录制或回放先前录制的游戏数据（这就是回放的工作原理）。
+ *	- Beacon NetDriver，负责不属于“正常”游戏流量的网络流量。
+ *
+ * 游戏或应用程序也可以实现并使用自定义的 NetDriver。
+ * NetConnection 代表连接到游戏的单个客户端（或者更一般地说，连接到 NetDriver）。
+ *
+ * 端点数据不是由 NetConnection 直接处理的。相反，NetConnection 会将数据路由到 Channel。
+ * 每个 NetConnection 都有自己的一组 Channel。
+ *
+ * 常见的 Channel 类型：
+ *
+ *	- Control Channel（控制通道）用于发送有关连接状态的信息（例如连接是否应关闭等）。
+ *	- Voice Channel（语音通道）可用于在客户端和服务器之间发送语音数据。
+ *	- Unique Actor Channel（唯一 Actor 通道）对于服务器复制到客户端的每个 Actor 都存在。
+ *
+ * 也可以创建和使用自定义 Channel 用于特殊目的（尽管这不太常见）。
+ *
+ *
+ *****************************************************************************************
+ * Game NetDrivers、NetConnections 和 Channels
+ *****************************************************************************************
+ *
+ * 通常情况下，对于“标准”游戏流量和连接，只存在一个 NetDriver（在客户端和服务器上创建）。
+ *
+ * 服务器 NetDriver 维护一个 NetConnection 列表，每个列表代表游戏中的一个玩家。它负责复制 Actor 数据。
+ *
+ * 客户端 NetDriver 有一个单一的 NetConnection，代表与服务器的连接。
+ *
+ * 在服务器和客户端上，NetDriver 负责从网络接收数据包，并将其传递给相应的 NetConnection（并在必要时建立新的 NetConnection）。
+ *
+ *
+ *****************************************************************************************
+ *****************************************************************************************
+ *****************************************************************************************
+ * 发起连接 / 握手流程
+ *****************************************************************************************
+ *****************************************************************************************
+ *****************************************************************************************
+ *
+ * UIpNetDriver 和 UIpConnection（或派生类）几乎是所有平台的引擎默认实现，以下所有内容描述了它们如何建立和管理连接。
+ * 然而，这些过程可能因 NetDriver 的实现而异。
+ *
+ * 服务器和客户端都有自己的 NetDriver，所有 UE 复制游戏流量都由 IpNetDriver 发送或接收。
+ * 此流量还包括建立连接以及在出现问题时重新建立连接的逻辑。
+ *
+ * 握手分布在几个不同的地方：NetDriver、PendingNetGame、World、PacketHandlers 等。
+ * 这种划分是由于不同的需求，例如：确定传入连接是否以“UE 协议”发送数据，
+ * 确定某个地址是否是恶意的，确定某个客户端是否具有正确的游戏版本等。
+ *
+ *
+ *****************************************************************************************
+ * 启动和握手
+ *****************************************************************************************
+ *
+ * 每当服务器加载地图时（通过 UEngine::LoadMap），我们会调用 UWorld::Listen。
+ * 该代码负责创建主 Game NetDriver，解析设置，并调用 UNetDriver::InitListen。
+ * 最终，该代码负责确定我们具体如何监听客户端连接。
+ * 例如，在 IpNetDriver 中，这就是我们通过调用配置的 Socket Subsystem 来确定我们将绑定的 IP / 端口的地方
+ *（参见 ISocketSubsystem::GetLocalBindAddresses 和 ISocketSubsystem::BindNextPort）。
+ *
+ * 一旦服务器开始监听，它就准备好开始接受客户端连接。
+ *
+ * 每当客户端想要加入服务器时，它们将首先通过 UEngine::Browse 使用服务器的 IP 建立一个新的 UPendingNetGame。
+ * UPendingNetGame::Initialize 和 UPendingNetGame::InitNetDriver 分别负责初始化设置和设置 NetDriver。
+ * 客户端将立即为此服务器建立一个 UNetConnection 作为此初始化的一部分，并将开始在该连接上向服务器发送数据，
+ * 从而启动握手过程。
+ *
+ * 在客户端和服务器上，UNetDriver::TickDispatch 通常负责接收网络数据。
+ * 通常，当我们收到一个数据包时，我们会检查其地址，并查看它是否来自我们已经知道的连接。
+ * 我们通过简单地维护一个从 FInternetAddr 到 UNetConnection 的映射来确定是否已为给定的源地址建立了连接。
+ *
+ * 如果数据包来自已建立的连接，我们将通过 UNetConnection::ReceivedRawPacket 将数据包传递给连接。
+ * 如果数据包不是来自已建立的连接，我们将其视为“无连接”并开始握手过程。
+ *
+ * 有关此握手工作原理的详细信息，请参阅 StatelessConnectionHandlerComponent.cpp。
+ *
+ *
+ *****************************************************************************************
+ * UWorld / UPendingNetGame / AGameModeBase 启动和握手
+ *****************************************************************************************
+ *
+ * 在客户端和服务器上的 UNetDriver 和 UNetConnection 完成握手过程后，
+ * 客户端将调用 UPendingNetGame::SendInitialJoin 以启动游戏级别的握手。
+ *
+ * 游戏级别的握手是通过一组更结构化和更复杂的 FNetControlMessages 完成的。
+ * 完整的控制消息集可以在 DataChannel.h 中找到。
+ *
+ * 处理这些控制消息的大部分工作是在 UWorld::NotifyControlMessage 和 UPendingNetGame::NotifyControlMessage 中完成的。简要来说，流程如下：
+ *
+ * 客户端的 UPendingNetGame::SendInitialJoin 发送 NMT_Hello。
+ *
+ * 服务器的 UWorld::NotifyControlMessage 接收 NMT_Hello，发送 NMT_Challenge。
+ *
+ * 客户端的 UPendingNetGame::NotifyControlMessage 接收 NMT_Challenge，并在 NMT_Login 中发回数据。
+ *
+ * 服务器的 UWorld::NotifyControlMessage 接收 NMT_Login，验证挑战数据，然后调用 AGameModeBase::PreLogin。
+ * 如果 PreLogin 没有报告任何错误，服务器调用 UWorld::WelcomePlayer，后者调用 AGameModeBase::GameWelcomePlayer，
+ * 并发送带有地图信息的 NMT_Welcome。
+ *
+ * 客户端的 UPendingNetGame::NotifyControlMessage 接收 NMT_Welcome，读取地图信息（以便稍后开始加载），
+ * 并发送带有客户端配置的网络速度的 NMT_NetSpeed。
+ *
+ * 服务器的 UWorld::NotifyControlMessage 接收 NMT_NetSpeed，并相应地调整连接的网络速度。
+ *
+ * 此时，握手被认为完成，玩家已完全连接到游戏。
+ * 根据加载地图所需的时间长短，客户端在控制权移交给 UWorld 之前，仍然可能在 UPendingNetGame 上收到一些非握手的控制消息。
+ *
+ * 当需要时，还有用于处理加密的额外步骤。
+ *
+ *
+ *****************************************************************************************
+ * 重新建立丢失的连接
+ *****************************************************************************************
+ *
+ * 在游戏过程中，由于多种原因，连接可能会丢失。
+ * 网络可能断开，用户可能从 LTE 切换到 WIFI，他们可能离开游戏等。
+ *
+ * 如果服务器发起这些断开连接之一，或者以其他方式意识到这一点（由于超时或错误），
+ * 那么将通过关闭 UNetConnection 并通知游戏来处理断开连接。
+ * 此时，由游戏决定是否支持“中途加入”或“重新加入”。
+ * 如果游戏支持，我们将完全重新开始上述握手流程。
+ *
+ * 如果只是暂时中断了客户端的连接，但服务器从未意识到，
+ * 那么引擎/游戏通常会自动恢复（尽管会有一些数据包丢失 / 延迟尖峰）。
+ *
+ * 然而，如果客户端的 IP 地址或端口因任何原因发生变化，但服务器不知道这一点，
+ * 那么我们将通过重做低级握手来开始恢复过程。在这种情况下，游戏代码将不会收到通知。
+ *
+ * 这个过程在 StatlessConnectionHandlerComponent.cpp 中介绍。
+ *
+ *
+ *****************************************************************************************
+ *****************************************************************************************
+ *****************************************************************************************
+ * 数据传输
+ *****************************************************************************************
+ *****************************************************************************************
+ *****************************************************************************************
+ *
+ * Game NetConnections 和 NetDrivers 通常对底层通信方法 / 技术不敏感。
+ * 这留给了子类来决定（例如 UIpConnection / UIpNetDriver 或 UWebSocketConnection / UWebSocketNetDriver）。
+ *
+ * 相反，UNetDriver 和 UNetConnection 使用 Packets 和 Bunches 工作。
+ *
+ * Packets 是在主机和客户端上的 NetConnection 对之间发送的数据块。
+ * Packets 包含关于数据包的元数据（例如头部信息和确认），以及 Bunches。
+ *
+ * Bunches 是在主机和客户端上的 Channel 对之间发送的数据块。
+ * 当 Connection 收到一个 Packet 时，该 Packet 将被拆分为单个的 Bunches。
+ * 然后，这些 Bunches 被传递给各个 Channel 进行进一步处理。
+ *
+ * 一个 Packet 可能不包含任何 Bunches、单个 Bunch 或多个 Bunches。
+ * 因为 Bunches 的大小限制可能大于单个 Packet 的大小限制，UE 支持部分 Bunch 的概念。
+ *
+ * 当一个 Bunch 太大时，在传输之前，我们会将其切割成多个较小的 Bunches。
+ * 这些 Bunches 将被标记为 PartialInitial、Partial 或 PartialFinal。使用这些信息，
+ * 我们可以在接收端重新组装这些 Bunches。
+ *
+ *	示例：客户端向服务器发送 RPC。
+ *		- 客户端调用 Server_RPC。
+ *		- 该请求（通过 NetDriver 和 NetConnection）被转发到拥有调用 RPC 的 Actor 的 Actor Channel。
+ *		- Actor Channel 将 RPC 标识符和参数序列化到一个 Bunch 中。该 Bunch 还将包含其 Actor Channel 的 ID。
+ *		- Actor Channel 然后请求 NetConnection 发送该 Bunch。
+ *		- 稍后，NetConnection 将此（和其他）数据组装到一个 Packet 中，并将其发送到服务器。
+ *		- 在服务器上，Packet 被 NetDriver 接收。
+ *		- NetDriver 检查发送 Packet 的地址，并将 Packet 交给适当的 NetConnection。
+ *		- NetConnection 将 Packet 拆分为其 Bunches（一个接一个）。
+ *		- NetConnection 使用 Bunch 上的 Channel ID 将 Bunch 路由到相应的 Actor Channel。
+ *		- ActorChannel 然后拆解 Bunch，看到它包含 RPC 数据，并使用 RPC ID 和序列化的参数
+ *			在 Actor 上调用相应的函数。
+ *
+ *
+ *****************************************************************************************
+ * 可靠性和重传
+ *****************************************************************************************
+ *
+ * UE 网络通常假定底层网络协议不保证可靠性。
+ * 相反，它实现了自己的数据包和 Bunch 的可靠性和重传机制。
+ *
+ * 当 NetConnection 建立时，它将为其 Packets 和 Bunches 建立一个序列号。
+ * 这些可以是固定的，也可以是随机的（当随机化时，序列号将由服务器发送）。
+ *
+ * 数据包编号是每个 NetConnection 的，为发送的每个数据包递增，每个数据包都将包含其数据包编号，
+ * 并且我们永远不会重传具有相同数据包编号的数据包。
+ *
+ * Bunch 编号是每个 Channel 的，为发送的每个 **可靠** Bunch 递增，并且每个 **可靠** Bunch 都将
+ * 包含其 Bunch 编号。然而，与数据包不同的是，确切的（可靠）Bunches 可能会被重传。这意味着我们
+ * 将重新发送具有相同 Bunch 编号的 Bunches。
+ *
+ * 注意，在代码中，上面描述的 Bunch 编号和数据包编号通常都被称为序列号。我们在这里做出区分以便更清晰地理解。
+ *
+ *	--- 检测传入的丢弃数据包 ---
+ *
+ *	通过分配数据包编号，我们可以轻松检测传入数据包何时丢失。
+ *	这只需通过获取最后成功接收的数据包编号与当前正在处理的数据包的数据包编号之间的差值来完成。
+ *
+ *	在良好条件下，所有数据包将按发送顺序接收。这意味着差值将为 +1。
+ *
+ *	如果差值大于 1，则表示我们错过了一些数据包。我们将只
+ *	假设丢失的数据包已被丢弃，但认为当前数据包已成功接收，
+ *	并继续使用其编号。
+ *
+ *	如果差值为负（或 0），则表示我们要么收到了一些乱序的数据包，要么外部
+ *	服务试图向我们重新发送数据（记住，引擎不会重用序列号）。
+ *
+ *	无论哪种情况，引擎通常会忽略丢失或无效的数据包，并且不会为它们发送 ACK。
+ *
+ *	我们确实有“修复”在同一帧内收到的乱序数据包的方法。
+ *	当启用时，如果我们检测到丢失的数据包（差值 > 1），我们将不会立即处理当前数据包。
+ *	相反，它会将其添加到一个队列中。下次我们成功收到数据包时（差值 == 1），我们将
+ *	查看队列头部是否有序。如果是，我们将处理它，否则我们将继续
+ *	接收数据包。
+ *
+ *	一旦我们读取了当前所有可用的数据包，我们将刷新此队列，处理任何剩余的数据包。
+ *	此时任何丢失的数据包将被假定为已丢弃。
+ *
+ *	每个成功接收的数据包都会将其数据包编号作为确认（ACK）发送回发送方。
+ *
+ *
+ *	--- 检测传出的丢弃数据包 ---
+ *
+ *
+ *	如上所述，每当成功接收到数据包时，接收方都会发回一个 ACK。
+ *	这些 ACK 将包含成功接收的数据包的数据包编号，按顺序排列。
+ *
+ *	类似于接收方跟踪数据包编号的方式，发送方将跟踪最高 ACK 的数据包编号。
+ *
+ *	当处理 ACK 时，低于我们最后收到的 ACK 的任何 ACK 将被忽略，并且数据包
+ *	编号中的任何间隙被视为未确认（NAKed）。
+ *
+ *	发送方负责处理这些 ACK 和 NAK，并重新发送任何丢失的数据。
+ *	新数据将被添加到新的传出数据包中（再次强调，我们不会重新发送我们已经发送过的数据包，
+ *	也不会重用数据包序列号）。
+ *
+ *
+ *	--- 重新发送丢失的数据 ---
+ *
+ *
+ *	如上所述，仅数据包本身不包含有用的游戏数据。相反，构成它们的 Bunches
+ *	才具有有意义的数据。
+ *
+ *	Bunches 可以标记为 Reliable 或 Unreliable。
+ *
+ *	如果 Bunches 被丢弃，引擎将不会尝试重新发送不可靠的 Bunches。因此，如果 Bunches
+ *	被标记为不可靠，游戏/引擎应该能够在没有它们的情况下继续，或者必须建立外部重试
+ *	机制，或者必须冗余发送数据。因此，以下所有内容仅
+ *	适用于可靠的 Bunches。
+ *
+ *	然而，引擎将尝试重新发送可靠的 Bunches。每当发送一个可靠的 Bunch 时，它将被
+ *	添加到一个未确认的可靠 Bunches 列表中。如果我们收到一个包含该 Bunch 的数据包的 NAK，
+ *	引擎将重新发送该 Bunch 的精确副本。注意，因为 Bunches 可能是部分的，即使丢失一个
+ *	部分 Bunch 也会导致整个 Bunch 的重传。当包含一个 Bunch 的所有数据包都已被 ACK 时，
+ *	我们将将其从列表中移除。
+ *
+ *	类似于数据包，我们将接收到的可靠 Bunch 的 Bunch 编号与最后成功接收的 Bunch 进行比较。
+ *	如果我们检测到差值为负，我们只需忽略该 Bunch。如果差值大于 1，我们将假设我们错过了一个 Bunch。
+ *	与数据包处理不同，我们不会丢弃此数据。
+ *	相反，我们将排队该 Bunch 并暂停处理 **任何** Bunches，无论是可靠的还是不可靠的。
+ *	直到我们检测到已收到丢失的 Bunches，处理才会恢复，届时我们将处理它们，
+ *	然后开始处理我们排队的 Bunches。
+ *	在等待丢失的 Bunches 时，或者当我们队列中仍有任何 Bunches 时，接收到的任何新 Bunches
+ *	将被添加到队列中，而不是立即处理。
+ *
+ */
+```
+
+---
+
+`BaseEngine.ini` 定义了要使用的 `NetDriver` 类.
+```cpp
+NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/OnlineSubsystemUtils.IpNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver")
+
++NetDriverDefinitions=(DefName="DemoNetDriver",DriverClassName="/Script/Engine.DemoNetDriver",DriverClassNameFallback="/Script/Engine.DemoNetDriver")
+```
+
+下面是简化的代码，做法就是从ini里面找到要创建的类，`NewObject` 创建之.
+```cpp
+UNetDriver* CreateNetDriver_Local(UEngine* Engine, FWorldContext& Context, 
+FName NetDriverDefinition, FName InNetDriverName)
+{
+	UNetDriver* ReturnVal = nullptr;
+	FNetDriverDefinition* Definition = nullptr;
+	auto FindNetDriverDefPred = [NetDriverDefinition](const FNetDriverDefinition& CurDef)
+	{
+		return CurDef.DefName == NetDriverDefinition;
+	};
+
+	Definition = Engine->NetDriverDefinitions.FindByPredicate(FindNetDriverDefPred);
+	ReturnVal = NewObject<UNetDriver>(GetTransientPackage(), NetDriverClass);
+	return ReturnVal;
+}
+```
+
+---
+
+##### 服务端
+
+服务端的 `NetDriver`:
+
+前面注释里说了
+```
+* 每当服务器加载地图时（通过 UEngine::LoadMap），我们会调用 UWorld::Listen。
+ * 该代码负责创建主 Game NetDriver，解析设置，并调用 UNetDriver::InitListen。
+ * 最终，该代码负责确定我们具体如何监听客户端连接。
+ * 例如，在 IpNetDriver 中，这就是我们通过调用配置的 Socket Subsystem 来确定我们将绑定的 IP / 端口的地方
+ *（参见 ISocketSubsystem::GetLocalBindAddresses 和 ISocketSubsystem::BindNextPort）。
+ *
+ * 一旦服务器开始监听，它就准备好开始接受客户端连接。
+```
+
+```cpp
+bool UGameInstance::EnableListenServer(bool bEnable, int32 PortOverride /*= 0*/)
+{
+	if (!World->GetNetDriver())
+	{
+		// This actually opens the port
+		FURL ListenURL = WorldContext->LastURL;
+		return World->Listen(ListenURL);
+	}
+}
+
+bool UWorld::Listen( FURL& InURL )
+{
+	NetDriver = /*...*/
+	NetDriver->SetWorld(this);
+
+	const bool bReuseAddressAndPort = WorldSettings ? WorldSettings->bReuseAddressAndPort : false;
+	if( !NetDriver->InitListen( this, InURL, bReuseAddressAndPort, Error ) )
+}
+```
+`InitListen`: 基类`UNetDriver`没有实现这个函数，直接到子类 `UIpNetDriver` 里面了.
+```cpp
+bool UIpNetDriver::InitListen( FNetworkNotify* InNotify, FURL& LocalURL, 
+bool bReuseAddressAndPort, FString& Error)
+{
+	InitBase( false, InNotify, LocalURL, bReuseAddressAndPort, Error );
+	InitConnectionlessHandler();
+	LocalURL.Port = LocalAddr->GetPort();
+}
+```
+`UNetDriver::InitBase` : <br>
+创建`UNetConnection`,<br>
+如果是服务端，还要创建 `UReplicationDriver`.
+
+`UIpNetDriver::InitBase` :<br>
+调用了 `Super::InitBase` 之后，创建 `SocketSubsystem`.
+
+```cpp
+bool UIpNetDriver::InitBase( bool bInitAsClient, FNetworkNotify* InNotify, 
+const FURL& URL, bool bReuseAddressAndPort, FString& Error )
+{
+	Super::InitBase(bInitAsClient, InNotify, URL, bReuseAddressAndPort, Error);
+	ISocketSubsystem* SocketSubsystem = GetSocketSubsystem();
+}
+```
+
+创建 `Socket` : 这一段有点绕，看图吧.
+
+![](Meta/img2/CreateBindSocket.png)
+
+Port端口号是从 `URL` 来的.
+
+在创建 `Socket` 并绑定了地址之后，`UIpNetDriver`把这两个数据拿过来:<br>
+```cpp
+bool UIpNetDriver::InitBase( bool bInitAsClient, FNetworkNotify* InNotify, const FURL& URL, bool bReuseAddressAndPort, FString& Error )
+{
+	/*...*/
+	SetSocketAndLocalAddress(Resolver->GetFirstSocket());
+}
+```
+
+之后的网络通信都是通过`UIpNetDriver`进行.
+
+
+---
+
+##### 客户端
+
+客户端的 `NetDriver`:
+```
+* 每当客户端想要加入服务器时，它们将首先通过 UEngine::Browse 使用服务器的 IP 建立一个新的 UPendingNetGame。
+ * UPendingNetGame::Initialize 和 UPendingNetGame::InitNetDriver 分别负责初始化设置和设置 NetDriver。
+ * 客户端将立即为此服务器建立一个 UNetConnection 作为此初始化的一部分，并将开始在该连接上向服务器发送数据，
+ * 从而启动握手过程。
+ ```
+
+整体流程:
+ ```cpp
+ UPendingNetGame::InitNetDriver
+    │
+    ├─ GEngine->CreateNamedNetDriver(NAME_PendingNetDriver)
+    │      └─ 最终创建 UIpNetDriver 实例
+    │
+    ├─ NetDriver->InitConnect(this, URL, ConnectionError)
+    │      │
+    │      └─ UIpNetDriver::InitConnect
+    │            ├─ InitBase(true, ...)   // 创建Socket、绑定本地端口
+    │            ├─ new UIpConnection (ServerConnection)
+    │            ├─ ServerConnection->InitLocalConnection(...)
+    │            └─ Resolver->InitConnect(...)  // 启动异步地址解析
+    │
+    ├─ 如果 Handler 存在，开始握手，否则直接 SendInitialJoin()
+    │
+    └─ UPendingNetGame::Tick 每帧驱动 NetDriver->TickDispatch / TickFlush
+```
+
+---
+
+```cpp
+EBrowseReturnVal::Type UEngine::Browse( FWorldContext& WorldContext, FURL URL, FString& Error )
+{
+	WorldContext.PendingNetGame = NewObject<UPendingNetGame>();
+	WorldContext.PendingNetGame->Initialize(URL); //-V595
+	WorldContext.PendingNetGame->InitNetDriver(); //-V595
+}
+
+void UPendingNetGame::InitNetDriver()
+{
+	if (GEngine->CreateNamedNetDriver(this, NAME_PendingNetDriver, NAME_GameNetDriver))
+	{
+		NetDriver = GEngine->FindNamedNetDriver(this, NAME_PendingNetDriver);
+	}
+
+	if( NetDriver->InitConnect( this, URL, ConnectionError ) )
+	{
+		if (ServerConn->Handler.IsValid())
+		{
+			ServerConn->Handler->BeginHandshaking(
+					FPacketHandlerHandshakeComplete::CreateUObject(this, &UPendingNetGame::SendInitialJoin));
+		}
+		else
+		{
+			SendInitialJoin();
+		}
+	}
+}
+```
+
+![](Meta/img2/PendingNetInitURL.png)
+
+
+```cpp
+bool UIpNetDriver::InitConnect( FNetworkNotify* InNotify, const FURL& ConnectURL, FString& Error )
+{
+	InitBase( true, InNotify, ConnectURL, false, Error );
+
+	ServerConnection = NewObject<UNetConnection>(GetTransientPackage(), NetConnectionClass);
+
+	ServerConnection->InitLocalConnection(this, SocketPrivate.Get(), ConnectURL, USOCK_Pending);
+
+	Resolver->InitConnect(ServerConnection, SocketSubsystem, GetSocket(), ConnectURL);
+
+	CreateInitialClientChannels();
+}
+```
+
+`ServerConnection` 的类型是 `UIpConnection`.
+
+`Resolver->InitConnect` = `FNetDriverAddressResolution::InitConnect`<br>
+这里异步获取服务器IP : 获取之后 存入`NetDriver` .
+
+![](Meta/img2/ClientNetInitConnect.png)
+
+
+`CreateInitialClientChannels`:
+
+![](Meta/img2/ClientChannel.png)
+
+与此同时，另外一边...<br>
+因为这里是异步获取服务器地址的，所以 在某个时间段 服务器地址 是无效的.
+
+`UPendingNetGame::Tick` --> `UNetDriver::TickFlush` --> `UIpConnection::Tick`
+
+`UIpConnection::Tick`:
+
+```cpp
+if (CheckResult == TryFirstAddress || CheckResult == TryNextAddress)
+{
+    SetSocket_Local(Resolver->GetResolutionSocket()); // 激活对应的Socket
+    RemoteAddr = Resolver->GetRemoteAddr();           // 设定目标地址
+    // ...
+}
+```
+
+
+确定后续所有 `sendto` 的目标地址（RemoteAddr）。<br>
+激活本地`Socket`（SocketPrivate），确保发出的包源地址与目标地址协议族一致<br>
+（IPv4 用 IPv4 Socket，IPv6 用 IPv6 Socket）。<br>
+
+这一步骤完成后，客户端才真正拥有了向服务器发送数据的能力。
+
+```cpp
+void UPendingNetGame::InitNetDriver()
+{
+	if( NetDriver->InitConnect( this, URL, ConnectionError ) )
+	{
+		if (ServerConn->Handler.IsValid())
+		{
+			ServerConn->Handler->BeginHandshaking(
+			FPacketHandlerHandshakeComplete::CreateUObject(this, &UPendingNetGame::SendInitialJoin));
+		}
+	}
+}
+```
+
+这里绑定了握手回调: 向服务器发送 Hello. <br>
+```cpp
+void UPendingNetGame::SendInitialJoin()
+{
+	if (NetDriver != nullptr)
+	{
+		if(UNetConnection* ServerConn = NetDriver->ServerConnection;)
+		{
+			FNetControlMessage<NMT_Hello>::Send(ServerConn, IsLittleEndian, LocalNetworkVersion, EncryptionToken, LocalNetworkFeatures);
+		}
+	}
+}
+```
+
+---
+
+
+#### 握手
+```
+ * 在客户端和服务器上的 UNetDriver 和 UNetConnection 完成握手过程后，
+ * 客户端将调用 UPendingNetGame::SendInitialJoin 以启动游戏级别的握手。
+ ```
+
+##### 组件初始化
+
+根据注释的内容，
+
+阶段 1：PacketHandler 的创建与组件添加
+
+` UIpNetDriver::InitConnect` → `ServerConnection->InitLocalConnection`:<br>
+```cpp
+// IpNetDriver.cpp
+bool UIpNetDriver::InitConnect(FNetworkNotify* InNotify, const FURL& ConnectURL, FString& Error)
+{
+    InitBase(true, InNotify, ConnectURL, false, Error);
+    
+    // 创建 UIpConnection 对象
+    ServerConnection = NewObject<UIpConnection>(...);
+    ServerConnection->InitLocalConnection(this, SocketPrivate.Get(), ConnectURL, USOCK_Pending);
+    // ...
+}
+```
+
+`UIpConnection::InitLocalConnection` :
+```cpp
+// IpConnection.cpp
+void UIpConnection::InitLocalConnection(UNetDriver* InDriver, FSocket* InSocket, 
+const FURL& InURL, ...)
+{
+    InitBase(InDriver, InSocket, InURL, InState, MaxPacket, PacketOverhead);
+    // ...
+}
+
+// NetConnection.cpp
+void UNetConnection::InitBase(UNetDriver* InDriver, FSocket* InSocket, 
+const FURL& InURL, EConnectionState InState, ...)
+{
+    // 创建 PacketHandler
+    Handler = MakeUnique<PacketHandler>();
+    Handler->Initialize(...);
+    
+	TSharedPtr<HandlerComponent> NewComponent =
+	Handler->AddHandler(TEXT("Engine.EngineHandlerComponentFactory(StatelessConnectHandlerComponent)"), true);
+    StatelessConnectComponent = StaticCastSharedPtr<StatelessConnectHandlerComponent>(NewComponent);
+
+	StatelessConnectHandlerComponent* CurComponent = StatelessConnectComponent.Pin().Get();
+	CurComponent->SetDriver(Driver);
+}
+```
+`Handler` 已经创建，在下面启动握手时 使用它.
+
+阶段 2：启动握手 (BeginHandshaking)
+
+```cpp
+// PendingNetGame.cpp
+void UPendingNetGame::InitNetDriver()
+{
+    // ... 创建 NetDriver 并调用 InitConnect ...
+    
+    if (NetDriver->InitConnect(this, URL, ConnectionError))
+    {
+        UNetConnection* ServerConn = NetDriver->ServerConnection;
+        if (ServerConn->Handler.IsValid())
+        {
+            // 绑定完成回调
+            ServerConn->Handler->BeginHandshaking(
+                FPacketHandlerHandshakeComplete::CreateUObject(this, &UPendingNetGame::SendInitialJoin)
+            );
+        }
+    }
+}
+```
+
+```cpp
+// PacketHandler.cpp
+void PacketHandler::BeginHandshaking(FPacketHandlerHandshakeComplete InHandshakeDel)
+{
+    HandshakeCompleteDelegate = InHandshakeDel;
+    
+    // 遍历所有组件，调用每个组件的 BeginHandshaking（如果需要）
+    for (int32 i=HandlerComponents.Num() - 1; i>=0; --i)
+	{
+		HandlerComponent& CurComponent = *HandlerComponents[i];
+
+		if (CurComponent.RequiresHandshake() && !CurComponent.IsInitialized())
+		{
+			CurComponent.NotifyHandshakeBegin();
+			break;
+		}
+	}
+}
+```
+
+`HandshakeCompleteDelegate` 这里绑定的函数在未来执行，而不是现在.
+
+对于 `StatelessConnectHandlerComponent`，<br>
+`BeginHandshaking` 向服务器发一个初始化的包.
+
+```cpp
+void StatelessConnectHandlerComponent::NotifyHandshakeBegin()
+{
+	using namespace UE::Net;
+
+	SendInitialPacket(static_cast<EHandshakeVersion>(CurrentHandshakeVersion));
+}
+```
+```cpp
+void StatelessConnectHandlerComponent::SendInitialPacket(EHandshakeVersion HandshakeVersion)
+{
+	const int32 AdjustedSize = GetAdjustedSizeBits(HANDSHAKE_PACKET_SIZE_BITS, HandshakeVersion);
+	FBitWriter InitialPacket(AdjustedSize + (BaseRandomDataLengthBytes * 8) + 1 /* Termination bit */);
+
+	EHandshakePacketModifier Modifier = bRestartedHandshake 
+	? EHandshakePacketModifier::RestartHandshake 
+	: EHandshakePacketModifier::None;
+
+	BeginHandshakePacket(InitialPacket, EHandshakePacketType::InitialPacket, HandshakeVersion, SentHandshakePacketCount, CachedClientID,Modifier);
+
+	uint8 SecretIdPad = 0;
+	uint8 PacketSizeFiller[28];
+
+	InitialPacket.WriteBit(SecretIdPad);
+
+	FMemory::Memzero(PacketSizeFiller, UE_ARRAY_COUNT(PacketSizeFiller));
+	InitialPacket.Serialize(PacketSizeFiller, UE_ARRAY_COUNT(PacketSizeFiller));
+
+	SendToServer(HandshakeVersion, EHandshakePacketType::InitialPacket, InitialPacket);
+}
+```
+GetAdjustedSizeBits 会加上 MagicHeader 长度、SessionID 和 ClientID 的位数.<br>
+`FBitWriter` 加上 随机数据长度：BaseRandomDataLengthBytes 是 16 字节（128 位），再预留 1 位终止位。
+
+`FBitWriter` 是 UE 的位序列化工具，可以按位写入数据.
+
+`BeginHandshakePacket` 将所有握手包共用的头部字段写入 `InitialPacket`.
+
+经过 `BeginHandshakePacket` 之后的 `InitialPacket` 内容如下:
+```cpp
+struct XX
+{
+	TBitArray<> MagicHeader;
+
+	uint32 CachedGlobalNetTravelCount;
+	uint32 ClientID;
+
+	uint8 bHandshakePacket;
+	uint8 bRestartHandshake;
+
+	uint8 MinSupportedHandshakeVersion;
+	uint8 HandshakeVersion;
+	uint8 HandshakePacketType;
+
+	uint8 SentHandshakePacketCount_LocalOrRemote;
+
+	uint32 LocalNetworkVersion;
+	EEngineNetworkRuntimeFeatures LocalNetworkFeatures;
+}
+```
+后面还要加上 : 
+```cpp
+struct XXX : public XX
+{
+	uint8 SecretIdPad;
+	uint8 PacketSizeFiller[28];
+}
+```
+最后 `SendToServer` 把这一坨发送给服务器.
+
+```cpp
+void StatelessConnectHandlerComponent::SendToServer(EHandshakeVersion HandshakeVersion, EHandshakePacketType PacketType, FBitWriter& Packet)
+{
+	if (UNetConnection* ServerConn = (Driver != nullptr ? Driver->ServerConnection : nullptr))
+	{
+		CapHandshakePacket(Packet, HandshakeVersion);
+	}
+}
+```
+
+`CapHandshakePacket` 还要写入 `RandomData` (8到16位) ， 以及 1位终止位.
+
+最终调用 `FSocketBSD::SendTo` 给服务器发送数据.
+
+---
+
+##### 服务器Challenge
+
+客户端初次给服务端发送了数据，服务器做了什么？
+
+下面是服务器视角.
+
+![](Meta/img2/ServerSendChallenge.png)
+
+服务器端每帧在 `UIpNetDriver::TickDispatch` 中调用 `FSocket::RecvFrom` 读取到达的 UDP 数据包。<br>
+对于尚未建立 `UNetConnection` 的客户端，数据包会进入 无连接处理流程。
+
+```cpp
+// IpNetDriver.cpp
+void UIpNetDriver::TickDispatch(float DeltaTime)
+{
+    for (FPacketIterator It(this); It; ++It)
+    {
+        FReceivedPacketView ReceivedPacket;
+        It.GetCurrentPacket(ReceivedPacket);
+        
+        // 如果找不到现有连接，调用 ProcessConnectionlessPacket
+        Connection = ProcessConnectionlessPacket(ReceivedPacket, WorkingBuffer);
+    }
+}
+```
+最终调用 `ConnectionlessHandler->IncomingConnectionless(ReceivedPacket)` ;
+
+```cpp
+// PacketHandler.cpp
+void PacketHandler::IncomingConnectionless(FReceivedPacketView& PacketRef)
+{
+    for (auto& Component : HandlerComponents)
+    {
+        Component->IncomingConnectionless(PacketRef);
+    }
+}
+```
+
+由于服务器端同样配置了 `StatelessConnectHandlerComponent`，该组件的 `IncomingConnectionless` 被调用。
+
+```cpp
+void StatelessConnectHandlerComponent::IncomingConnectionless(FIncomingPacketRef PacketRef)
+{
+	FBitReader& Packet = PacketRef.Packet;
+	const TSharedPtr<const FInternetAddr> Address = PacketRef.Address;
+	if (MagicHeader.Num() > 0)
+	{
+		/* 对比MagicHeader */
+	}
+
+	bool bHasValidSessionID = true;
+	uint8 SessionID = 0;
+	uint8 ClientID = 0;
+
+	/* 读取 SessionID ClientID */
+
+	/*	已经读取出3个信息，MagicHeader,SessionID,ClientID
+		根据前面分析的结构体顺序，接下来就是bHandshakePacket 
+	 */
+
+	 /* 必须为 1，表示这是一个握手包 */
+	bool bHandshakePacket = !!Packet.ReadBit() && !Packet.IsError();
+
+	if (bHandshakePacket)
+	{
+		/* 如果是握手包， 解析包的数据. */
+	}
+}
+```
+
+版本检查:
+```cpp
+EHandshakeVersion TargetVersion;
+bool bValidVersion = CheckVersion(HandshakeData, TargetVersion);
+```
+`CheckVersion` 比较客户端的 `MinVersion` 和 `CurVersion` 是否在服务器支持范围内，<br>
+并选定一个双方兼容的 `TargetVersion`（通常取客户端 CurVersion 和服务器 CurrentHandshakeVersion 的较小值）。
+
+若版本不兼容，服务器可能发送 `VersionUpgrade` 消息或直接丢弃包.
+
+确认为 `Initial Packet` 并发送 `Challenge`:
+```cpp
+if (bInitialConnect) // HandshakePacketType == InitialPacket && Timestamp == 0.0
+{
+    SendConnectChallenge
+	(
+		FCommonSendToClientParams(Address, TargetVersion, ClientID),
+    	HandshakeData.RemoteSentHandshakePacketCount
+	);
+}
+```
+生成并发送 `Challenge` :
+```cpp
+void StatelessConnectHandlerComponent::SendConnectChallenge(FCommonSendToClientParams CommonParams, 
+uint8 ClientSentHandshakePacketCount)
+{
+	// 计算包大小
+	GetAdjustedSizeBits...
+
+	// 写入通用包头
+	BeginHandshakePacket...
+
+	// 生成 Cookie
+	GenerateCookie...
+
+	// 写入 SecretId、Timestamp、Cookie
+
+	// 发送
+    SendToClient...
+}
+```
+
+Challenge 包与 Initial Packet 结构相似，<br>
+包含：<br>
+相同的包头（SessionID=0, ClientID 原样返回, Handshake=1, Restart=0）<br>
+协议版本信息<br>
+HandshakePacketType = Challenge<br>
+SecretId（1 bit）：指示使用了哪个服务器密钥（0 或 1）<br>
+Timestamp（double，8 字节）<br>
+Cookie（20 字节）<br>
+
+---
+
+##### 客户端ChallengeResponse
+
+![](Meta/img2/ClientChallengeResponse.png)
+
+判断包类型，
+```cpp
+void StatelessConnectHandlerComponent::Incoming(FBitReader& Packet)
+{
+	bool bHandshakePacket = !!Packet.ReadBit() && !Packet.IsError();
+	if (bHandshakePacket)
+	{
+		FParsedHandshakeData HandshakeData;
+		bHandshakePacket = ParseHandshakePacket(Packet, HandshakeData);
+		if (bHandshakePacket)
+		{
+			const bool bIsChallengePacket = ;
+			const bool bIsInitialChallengePacket = ;
+			const bool bIsUpgradePacket = ;
+		}
+	}
+}
+```
+如果是 Challenge包， 回应它.
+```cpp
+/* 这是服务器发来的 Challenge包 的解析内容*/
+FParsedHandshakeData HandshakeData;
+if (bIsChallengePacket)
+{
+	// 缓存服务器的 SessionID
+	CachedGlobalNetTravelCount = SessionID;
+
+	LastChallengeTimestamp = (Driver != nullptr ? Driver->GetElapsedTime() : 0.0);
+
+	SendChallengeResponse(HandshakeData.RemoteCurVersion, HandshakeData.SecretId, 
+	HandshakeData.Timestamp, HandshakeData.Cookie);
+
+	// Utilize this state as an intermediary, indicating that the challenge response has been sent
+	// 将组件状态设为 InitializedOnLocal（表示已发送 Response，等待 Ack）
+	SetState(UE::Handler::Component::State::InitializedOnLocal);
+}
+```
+
+`ChallengeResponse`数据包的内容:<br>
+与 Initial Packet 相同的包头结构，但 HandshakePacketType = Response（或 RestartResponse）。<br>
+SecretId：原样返回。<br>
+Timestamp：原样返回。<br>
+Cookie：原样返回。<br>
+
+若为重启握手 ，额外携带 AuthorisedCookie（之前成功握手的 Cookie）。<br>
+这里是`false` 不额外携带这个数据.
+
+---
+
+##### 服务器ChallengeAck
+
+客户端已经发送 `ChallengeResponse` ， 服务器如何回应?
+
+![](Meta/img2/ServerChallengeAck.png)
+
+```cpp
+void StatelessConnectHandlerComponent::IncomingConnectionless(FIncomingPacketRef PacketRef)
+{
+	 if (bValidCookieLifetime && bValidSecretIdTimestamp)
+    {
+        // 1. 重新生成 Cookie
+        uint8 RegenCookie[COOKIE_BYTE_SIZE];
+        GenerateCookie(Address, HandshakeData.SecretId, HandshakeData.Timestamp, RegenCookie);
+
+        // 2. 比对客户端发来的 Cookie 与重新生成的 Cookie
+        bChallengeSuccess = FMemory::Memcmp(HandshakeData.Cookie, RegenCookie, COOKIE_BYTE_SIZE) == 0;
+
+        if (bChallengeSuccess)
+        {
+            // 验证成功，后续处理...
+        }
+    }
+}
+```
+
+验证成功：
+```cpp
+// 1. 保存授权 Cookie
+if (HandshakeData.bRestartHandshake)
+{
+    FMemory::Memcpy(AuthorisedCookie, HandshakeData.OrigCookie, COOKIE_BYTE_SIZE);
+}
+else
+{
+    // 从 Cookie 中提取初始序列号
+    int16* CurSequence = (int16*)HandshakeData.Cookie;
+    LastServerSequence = *CurSequence & (MAX_PACKETID - 1);
+    LastClientSequence = *(CurSequence + 1) & (MAX_PACKETID - 1);
+    FMemory::Memcpy(AuthorisedCookie, HandshakeData.Cookie, COOKIE_BYTE_SIZE);
+}
+
+bRestartedHandshake = HandshakeData.bRestartHandshake;
+LastChallengeSuccessAddress = Address->Clone();
+LastRemoteHandshakeVersion = TargetVersion;
+CachedClientID = ClientID;
+
+// 2. 更新最低客户端版本记录
+if (TargetVersion < MinClientHandshakeVersion)
+{
+    MinClientHandshakeVersion = TargetVersion;
+}
+
+// 3. 发送 Ack 包
+SendChallengeAck(FCommonSendToClientParams(Address, TargetVersion, ClientID),
+HandshakeData.RemoteSentHandshakePacketCount, AuthorisedCookie);
+```
+
+Ack 包内容：<br>
+与 Challenge 相同的包头结构。<br>
+HandshakePacketType = Ack。<br>
+Timestamp = -1.0：用于客户端区分 Ack 和 Challenge（Challenge 的 Timestamp > 0）。<br>
+Cookie：服务器回传的授权 Cookie，其中嵌入了初始序列号。<br>
+
+服务器将通过 `Challenge` 的地址保存在 `LastChallengeSuccessAddress`.
+
+![](Meta/img2/ServerChallengeAck.png)
+
+当上面发送Ack的函数执行完成后，回到 `ProcessConnectionlessPacket` 函数:<br>
+
+服务器会在这里给客户端创建 `UIpConnection`.
+```cpp
+UNetConnection* UIpNetDriver::ProcessConnectionlessPacket(FReceivedPacketView& PacketRef, const FPacketBufferView& WorkingBuffer)
+{
+	UNetConnection* ReturnVal = nullptr;
+	EIncomingResult Result = ConnectionlessHandler->IncomingConnectionless(PacketRef);
+
+	if (Result == EIncomingResult::Success)
+	{
+		bPassedChallenge = StatelessConnect->HasPassedChallenge(Address, bRestartedHandshake);
+
+		if (bPassedChallenge)
+		{
+			if (!bRestartedHandshake)
+			{
+				ReturnVal = NewObject<UIpConnection>(GetTransientPackage(), NetConnectionClass);
+
+				ReturnVal->InitRemoteConnection(this, SocketPrivate.Get(), World ? World->URL : FURL(), *Address, USOCK_Open);
+
+				ReturnVal->InitSequence(ClientSequence, ServerSequence);
+				ReturnVal->Handler->BeginHandshaking();
+
+				Notify->NotifyAcceptedConnection(ReturnVal);
+
+				AddClientConnection(ReturnVal);
+				RemoveFromNewIPTracking(*Address.Get());
+			}
+		}
+	}
+}
+```
+把 `Connection` 添加到Map，这个Map在将来有用.
+```cpp
+void UNetDriver::AddClientConnection(UNetConnection* NewConnection)
+{
+	TSharedPtr<const FInternetAddr> ConnAddr = NewConnection->GetRemoteAddr();
+	MappedClientConnections.Add(ConnAddr.ToSharedRef(), NewConnection);
+}
+```
+
+---
+
+##### 客户端的Hello
+
+```
+ * 在客户端和服务器上的 UNetDriver 和 UNetConnection 完成握手过程后，
+ * 客户端将调用 UPendingNetGame::SendInitialJoin 以启动游戏级别的握手。
+ *
+ * 游戏级别的握手是通过一组更结构化和更复杂的 FNetControlMessages 完成的。
+ * 完整的控制消息集可以在 DataChannel.h 中找到。
+ *
+ * 处理这些控制消息的大部分工作是在 UWorld::NotifyControlMessage 和 UPendingNetGame::NotifyControlMessage 中完成的。
+
+ * 简要来说，流程如下：
+ *
+ * 客户端的 UPendingNetGame::SendInitialJoin 发送 NMT_Hello。
+ *
+ * 服务器的 UWorld::NotifyControlMessage 接收 NMT_Hello，发送 NMT_Challenge。
+ *
+ * 客户端的 UPendingNetGame::NotifyControlMessage 接收 NMT_Challenge，并在 NMT_Login 中发回数据。
+ ```
+
+
+客户端收到服务器的 Ack包 :
+
+![](Meta/img2/ClientInitSequence.png)
+
+![](Meta/img2/ClientAck.png)
+
+`Initialized();`
+
+```cpp
+void HandlerComponent::Initialized()
+{
+	bInitialized = true;
+	Handler->HandlerComponentInitialized(this);
+}
+
+void PacketHandler::HandlerComponentInitialized(HandlerComponent* InComponent)
+{
+	/*...*/
+	HandlerInitialized();
+}
+
+void PacketHandler::HandlerInitialized()
+{
+	SetState(UE::Handler::State::Initialized);
+	HandshakeCompleteDel.ExecuteIfBound();
+}
+```
+
+`HandshakeCompleteDel.ExecuteIfBound();` <br>
+此时 在最开始的地方绑定的那个函数 `void UPendingNetGame::SendInitialJoin()` 要执行了.
+
+```cpp
+void UPendingNetGame::InitNetDriver()
+{
+	if (GEngine->CreateNamedNetDriver(this, NAME_PendingNetDriver, NAME_GameNetDriver))
+	{
+		NetDriver = GEngine->FindNamedNetDriver(this, NAME_PendingNetDriver);
+	}
+
+	if( NetDriver->InitConnect( this, URL, ConnectionError ) )
+	{
+		UNetConnection* ServerConn = NetDriver->ServerConnection;
+		if (ServerConn->Handler.IsValid())
+		{
+			ServerConn->Handler->BeginHandshaking
+			(
+				FPacketHandlerHandshakeComplete::CreateUObject(this, &UPendingNetGame::SendInitialJoin)
+			);
+		}
+	}
+}
+```
+
+`UPendingNetGame::SendInitialJoin` 向服务器发送 `NMT_Hello`.
+
+---
+
+##### 服务器的InComing
+
+前面的代码中出现了 `InComing` 和 `IncomingConnectionless`，这两个函数的调用时机是???<br>
+
+因为前面服务器给客户端创建了`UIpConnection`，以后的连接就是通过`InComing`，而不再是`IncomingConnectionless`.
+
+```cpp
+void UIpNetDriver::TickDispatch(float DeltaTime)
+{
+    // ...
+    for (FPacketIterator It(this); It; ++It)
+    {
+        FReceivedPacketView ReceivedPacket;
+        It.GetCurrentPacket(ReceivedPacket);
+        const TSharedRef<const FInternetAddr> FromAddr = ReceivedPacket.Address.ToSharedRef();
+        UNetConnection* Connection = nullptr;
+
+		/*...*/
+        // 1. 尝试在已建立的连接中查找
+        if (Connection == nullptr)
+        {
+            auto* Result = MappedClientConnections.Find(FromAddr);
+            if (Result != nullptr)
+            {
+                Connection = *Result;
+            }
+        }
+
+        // 2. 如果找不到，进入无连接处理
+        if (Connection == nullptr)
+        {
+            // ... DDoS 检查 ...
+            if (bAcceptingConnection)
+            {
+                FPacketBufferView WorkingBuffer = It.GetWorkingBuffer();
+                Connection = ProcessConnectionlessPacket(ReceivedPacket, WorkingBuffer);
+            }
+        }
+
+        // 3. 如果最终拿到了连接，调用 ReceivedRawPacket
+        if (Connection != nullptr && !bIgnorePacket)
+        {
+            Connection->ReceivedRawPacket(ReceivedPacket.DataView.GetData(), ReceivedPacket.DataView.NumBytes());
+        }
+    }
+}
+```
+
+`MappedClientConnections` 是一个地址到 `UNetConnection*` 的映射表。
+
+只有查表失败时，才会进入` ProcessConnectionlessPacket`，<br>
+进而调用 `ConnectionlessHandler->IncomingConnectionless`（标志设为 true）。
+
+```cpp
+EIncomingResult IncomingConnectionless(FReceivedPacketView& PacketView)
+{
+	PacketView.Traits.bConnectionlessPacket = true;
+
+	return Incoming_Internal(PacketView);
+}
+```
+
+查表成功时，直接调用 `Connection->ReceivedRawPacket`，<br>
+该函数内部会调用连接私有的 `Handler->Incoming`，而 `Incoming` 函数不修改 `bConnectionlessPacket` 标志，因此它保持默认值 `false`。
+
+`Response` 包到达时：<br>
+`MappedClientConnections` 中尚无该地址 → 进入 `ProcessConnectionlessPacket`.<br>
+`ConnectionlessHandler->IncomingConnectionless` 验证通过，`HasPassedChallenge` 返回 true.<br>
+
+`ProcessConnectionlessPacket` 内部创建 `UIpConnection` 并调用 `AddClientConnection`，将该地址加入映射表.<br>
+函数返回新连接，`TickDispatch` 随后调用 `Connection->ReceivedRawPacket`.<br>
+
+注意：`Response` 包本身在 `IncomingConnectionless` 中已被完全消费，`ReceivedRawPacket` 可能处理的是剩余数据（通常为空）.<br>
+
+
+下一个包（如 `NMT_Hello`）到达时：<br>
+`MappedClientConnections.Find(FromAddr)` 命中，`Connection` 非空。<br>
+完全跳过 `ProcessConnectionlessPacket`，直接进入 `Connection->ReceivedRawPacket`。<br>
+调用链为 `Handler->Incoming`（非 `IncomingConnectionless`），`bConnectionlessPacket` 保持默认 `false`。<br>
+
+
+---
+
+##### 服务器回应Hello
+
+```
+ * 客户端的 UPendingNetGame::SendInitialJoin 发送 NMT_Hello。
+ *
+ * 服务器的 UWorld::NotifyControlMessage 接收 NMT_Hello，发送 NMT_Challenge。
+ *
+ * 客户端的 UPendingNetGame::NotifyControlMessage 接收 NMT_Challenge，并在 NMT_Login 中发回数据。
+ ```
 
 
 
+ ![](Meta/img2/ServerHello.png)
+
+ 服务器接收 NMT_Hello，发送 NMT_Challenge :
+
+ ```cpp
+ void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+{
+	switch (MessageType)
+	{
+		case NMT_Hello:
+		{
+			if (FNetControlMessage<NMT_Hello>::Receive(Bunch, IsLittleEndian, RemoteNetworkVersion, EncryptionToken, RemoteNetworkFeatures))
+			{
+				Connection->SendChallengeControlMessage();
+			}
+		}
+	}
+}
+ ```
+
+ ```cpp
+void UNetConnection::SendChallengeControlMessage()
+{
+	if (GetConnectionState() != USOCK_Invalid && GetConnectionState() != USOCK_Closed && Driver)
+	{
+		Challenge = FString::Printf(TEXT("%08X"), FPlatformTime::Cycles());
+		SetExpectedClientLoginMsgType(NMT_Login);
+
+		FNetControlMessage<NMT_Challenge>::Send(this, Challenge);
+		FlushNet();
+	}
+}
+```
+
+---
+
+##### 登录
+
+
+```
+ * 客户端的 UPendingNetGame::SendInitialJoin 发送 NMT_Hello。
+ *
+ * 服务器的 UWorld::NotifyControlMessage 接收 NMT_Hello，发送 NMT_Challenge。
+ *
+ * 客户端的 UPendingNetGame::NotifyControlMessage 接收 NMT_Challenge，并在 NMT_Login 中发回数据。
+ ```
+
+客户端接收 NMT_Challenge，发送 NMT_Login.
+
+```cpp
+void UPendingNetGame::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+{
+	switch (MessageType)
+	{
+		case NMT_Challenge:
+		{
+			if (FNetControlMessage<NMT_Challenge>::Receive(Bunch, Connection->Challenge))
+			{
+				FNetControlMessage<NMT_Login>::Send(Connection, Connection->ClientResponse, URLString, Connection->PlayerId, OnlinePlatformNameString);
+
+				NetDriver->ServerConnection->FlushNet();
+			}
+		}
+	}
+}
+```
+
+---
+
+服务器收到 NMT_Login :
+
+```
+* 服务器的 UWorld::NotifyControlMessage 接收 NMT_Login，验证挑战数据，然后调用 AGameModeBase::PreLogin。
+* 如果 PreLogin 没有报告任何错误，服务器调用 UWorld::WelcomePlayer，后者调用 AGameModeBase::GameWelcomePlayer，
+* 并发送带有地图信息的 NMT_Welcome。
+```
+
+
+```cpp
+void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+{
+	switch (MessageType)
+	{
+		case NMT_Login:
+		{
+			FUniqueNetIdRepl UniqueIdRepl;
+			FString OnlinePlatformName;
+			bool bReceived = FNetControlMessage<NMT_Login>::Receive(Bunch, Connection->ClientResponse, RequestURL, UniqueIdRepl,OnlinePlatformName);
+
+			if(bReceived)
+			{
+				// keep track of net id for player associated with remote connection
+				Connection->PlayerId = UniqueIdRepl;
+
+				// keep track of the online platform the player associated with this connection is using.
+				Connection->SetPlayerOnlinePlatformName(FName(*OnlinePlatformName));
+
+				// ask the game code if this player can join
+				AGameModeBase* GameMode = GetAuthGameMode();
+				AGameModeBase::FOnPreLoginCompleteDelegate OnComplete = AGameModeBase::FOnPreLoginCompleteDelegate::CreateUObject
+				(
+					this, &UWorld::PreLoginComplete, TWeakObjectPtr<UNetConnection>(Connection)
+				);
+				if (GameMode)
+				{
+					GameMode->PreLoginAsync(Tmp, Connection->LowLevelGetRemoteAddress(), Connection->PlayerId, OnComplete);
+				}
+			}
+		}
+	}
+}
+```
+
+```cpp
+void AGameModeBase::PreLoginAsync(const FString& Options, const FString& Address, const FUniqueNetIdRepl& UniqueId, const FOnPreLoginCompleteDelegate& OnComplete)
+{
+	FString ErrorMessage;
+	PreLogin(Options, Address, UniqueId, ErrorMessage);
+	OnComplete.ExecuteIfBound(ErrorMessage);
+}
+```
+
+`PreLogin` : 接受或拒绝试图加入服务器的玩家。<br>
+如果将错误信息设置为非空字符串，则登录将失败。<br>
+`PreLogin` 在登录之前被调用。登录被调用之前可能会经过很长的游戏时间。
+
+`PreLogin` 执行完之后，调用下面这个在前面 `OnComplete` 绑定的函数: 
+```cpp
+void UWorld::PreLoginComplete(const FString& ErrorMsg, TWeakObjectPtr<UNetConnection> WeakConnection)
+{
+	UNetConnection* Connection = WeakConnection.Get();
+	if (!PreLoginCheckError(Connection, ErrorMsg))
+	{
+		return;
+	}
+
+	WelcomePlayer(Connection);
+}
+```
+
+```cpp
+void UWorld::WelcomePlayer(UNetConnection* Connection)
+{
+	GameName = AuthorityGameMode->GetClass()->GetPathName();
+	AuthorityGameMode->GameWelcomePlayer(Connection, RedirectURL);
+
+	FNetControlMessage<NMT_Welcome>::Send(Connection, LevelName, GameName, RedirectURL);
+}
+```
+
+---
+客户端收到 NMT_Welcome.
+```
+* 客户端的 UPendingNetGame::NotifyControlMessage 接收 NMT_Welcome，读取地图信息（以便稍后开始加载），
+* 并发送带有客户端配置的网络速度的 NMT_NetSpeed。
+```
+
+```cpp
+void UPendingNetGame::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+{
+	switch (MessageType)
+	{
+		case NMT_Welcome:
+		{
+			// Server accepted connection.
+			FString GameName;
+			FString RedirectURL;
+
+			if (FNetControlMessage<NMT_Welcome>::Receive(Bunch, URL.Map, GameName, RedirectURL))
+			{
+				/*...*/
+				// Send out netspeed now that we're connected
+				FNetControlMessage<NMT_Netspeed>::Send(Connection, Connection->CurrentNetSpeed);
+
+				// We have successfully connected
+				// TickWorldTravel will load the map and call LoadMapCompleted which eventually calls SendJoin
+				bSuccessfullyConnected = true;
+			}
+		}
+	}
+}
+```
+`bSuccessfullyConnected`:<br>
+我们已成功连接.<br>
+`UEngine::TickWorldTravel` 将加载地图，并调用 `LoadMapCompleted` 函数，该函数最终会调用 `SendJoin`.
+
+```cpp
+void UEngine::TickWorldTravel(FWorldContext& Context, float DeltaSeconds)
+{
+	if (!Context.PendingNetGame->bLoadedMapSuccessfully)
+	{
+		const bool bLoadedMapSuccessfully = LoadMap(Context, Context.PendingNetGame->URL, Context.PendingNetGame, Error);
+
+		Context.PendingNetGame->LoadMapCompleted(this, Context, bLoadedMapSuccessfully, Error);
+	}
+
+	/* PendingNetGame->LoadMapCompleted 会把 bLoadedMapSuccessfully 设置为true. */
+	if (Context.PendingNetGame && Context.PendingNetGame->bLoadedMapSuccessfully /*...*/)
+	{
+		if (!Context.PendingNetGame->HasFailedTravel() )
+		{
+			Context.PendingNetGame->TravelCompleted(this, Context);
+			Context.PendingNetGame = nullptr;
+		}
+	}
+}
+```
+
+---
+
+与此同时，服务器那边....
+
+```
+* 服务器的 UWorld::NotifyControlMessage 接收 NMT_NetSpeed，并相应地调整连接的网络速度。
+```
+服务器视角:
+
+```cpp
+void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+{
+	switch (MessageType)
+	{
+		case NMT_Netspeed:
+		{
+			int32 Rate;
+
+			if (FNetControlMessage<NMT_Netspeed>::Receive(Bunch, Rate))
+			{
+				Connection->CurrentNetSpeed = FMath::Clamp(Rate, 1800, NetDriver->MaxClientRate);
+				UE_LOG(LogNet, Log, TEXT("Client netspeed is %i"), Connection->CurrentNetSpeed);
+			}
+			break;
+		}
+	}
+}
+```
+
+```
+* 此时，握手被认为完成，玩家已完全连接到游戏。
+* 根据加载地图所需的时间长短，客户端在控制权移交给 UWorld 之前，仍然可能在 UPendingNetGame 上收到一些非握手的控制消息。 
+```
+
+---
+
+回到客户端视角，客户端要发送 NMT_Join :
+```cpp
+Context.PendingNetGame->TravelCompleted(this, Context);
+```
+
+```cpp
+void UPendingNetGame::TravelCompleted(UEngine* Engine, FWorldContext& Context)
+{
+	// Show connecting message, cause precaching to occur.
+	Engine->TransitionType = ETransitionType::Connecting;
+
+	Engine->RedrawViewports(false);
+
+	// Send join.
+	Context.PendingNetGame->SendJoin();
+	Context.PendingNetGame->NetDriver = NULL;
+}
+
+void UPendingNetGame::SendJoin()
+{
+	bSentJoinRequest = true;
+
+	FNetControlMessage<NMT_Join>::Send(NetDriver->ServerConnection);
+	NetDriver->ServerConnection->FlushNet(true);
+}
+```
+
+---
+
+服务器收到 NMT_Join:
+
+```cpp
+void UWorld::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, class FInBunch& Bunch)
+{
+	switch (MessageType)
+	{
+		case NMT_Join:
+		{
+			if (Connection->PlayerController == NULL)
+			{
+				// Spawn the player-actor for this network player.
+				Connection->PlayerController = SpawnPlayActor( Connection, ROLE_AutonomousProxy, 
+				InURL, Connection->PlayerId, ErrorMsg );
+			}
+		}
+	}
+}
+```
+
+```cpp
+APlayerController* UWorld::SpawnPlayActor(UPlayer* NewPlayer, ENetRole RemoteRole, const FURL& InURL, const FUniqueNetIdRepl& UniqueId, FString& Error, uint8 InNetPlayerIndex)
+{
+	APlayerController* const NewPlayerController = GameMode->Login(NewPlayer, RemoteRole, 
+	*InURL.Portal, Options, UniqueId, Error);
+
+	// Possess the newly-spawned player.
+	NewPlayerController->NetPlayerIndex = InNetPlayerIndex;
+	NewPlayerController->SetRole(ROLE_Authority);
+
+	/* 这里是 SetReplicates(true) .*/
+	NewPlayerController->SetReplicates(RemoteRole != ROLE_None);
+
+	NewPlayerController->SetAutonomousProxy(true);
+	NewPlayerController->SetPlayer(NewPlayer);
+	
+	GameMode->PostLogin(NewPlayerController);
+
+	return NewPlayerController;
+}
+```
+
+这里要注意的是 `NewPlayerController` 开启了复制，
+
+`SetPlayer` 将连接的 `OwningActor` 设置为服务器上的 `PlayerController` : <br>
+这个指针是连接与游戏世界之间的核心桥梁，决定了属性复制和 RPC 的路由规则。<br>
+
+```cpp
+void APlayerController::SetPlayer( UPlayer* InPlayer )
+{
+	ULocalPlayer *LP = Cast<ULocalPlayer>(InPlayer);
+	if (LP != NULL)
+	{
+		// Clients need this marked as local (server already knew at construction time)
+		SetAsLocalPlayerController();
+		LP->InitOnlineSession();
+		InitInputSystem();
+	}
+	else
+	{
+		NetConnection = Cast<UNetConnection>(InPlayer);
+		if (NetConnection)
+		{
+			NetConnection->OwningActor = this;
+		}
+	}
+}
+```
+
+`PostLogin`:<br>
+创建HUD,开启语音,<br>
+判断是不是观战模式或者回放模式，<br>
+为玩家生成Pawn.
+
+对于新创建的 `PlayerController` 和 `Pawn` 会被复制到客户端上.
+
+---
+
+#### 复制系统
+
+```cpp
+┌─────────────────────────────────────────────────────────┐
+│                    AActor / UActorComponent             │
+│   (UPROPERTY(Replicated), UFUNCTION(Server, Client))   │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                    UActorChannel                        │
+│  - 负责单个 Actor 在某连接上的所有复制通信               │
+│  - 持有 ActorReplicator (主复制器)                      │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                   FObjectReplicator                     │
+│  - 每个复制对象（Actor 或子对象）一个                   │
+│  - 管理属性比较、序列化、可靠队列                        │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                      FRepLayout                         │
+│  - 反射生成的元数据，描述一个类中所有可复制属性          │
+│  - 提供快速比较、序列化、反序列化能力                    │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                       FRepState                         │
+│  - 每个连接的复制状态（如已发送的属性缓存、历史脏标记）  │
+│  - 用于增量压缩（只发送变化的数据）                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### UHT
+
+```cpp
+UPROPERTY(Replicated)
+float MyFloat;
+	
+UPROPERTY(Replicated)
+int MyInt;
+```
+对应UHT生成的代码:
+```cpp
+enum class ENetFields_Private : uint16
+{
+	NETFIELD_REP_START=(uint16)((int32)Super::ENetFields_Private::NETFIELD_REP_END + (int32)1),
+
+	MyFloat=NETFIELD_REP_START, 
+	MyInt, 
+
+	NETFIELD_REP_END=MyInt	
+};
+```
+
+为每个 `Replicated` 属性分配一个编译期确定的唯一索引.<br>
+引擎运行时通过 `FRepLayout` 使用该索引快速定位属性，用于属性比较、序列化和脏标记.<br>
+继承链上的每个类都有自己的 `ENetFields_Private`，索引递增确保不冲突.<br>
+
+---
+
+```cpp
+NO_API virtual void ValidateGeneratedRepEnums(const TArray<struct FRepRecord>& ClassReps) const override;
+
+void AMyActor::ValidateGeneratedRepEnums(const TArray<struct FRepRecord>& ClassReps) const
+{
+	static const FName Name_MyFloat(TEXT("MyFloat"));
+	static const FName Name_MyInt(TEXT("MyInt"));
+
+	const bool bIsValid = true
+	&& Name_MyFloat == ClassReps[(int32)ENetFields_Private::MyFloat].Property->GetFName()
+	&& Name_MyInt == ClassReps[(int32)ENetFields_Private::MyInt].Property->GetFName();
+
+	checkf(bIsValid, TEXT("UHT Generated Rep Indices do not match runtime populated Rep Indices for properties in AMyActor"));
+}
+```
+
+确保 编译时生成的索引顺序 与 运行时反射收集的顺序 一致。<br>
+若不一致，checkf 会触发断言，防止因索引错位导致的网络同步错误。<br>
+
+---
+
+```cpp
+const UECodeGen_Private::FFloatPropertyParams Z_Construct_UClass_AMyActor_Statics::NewProp_MyFloatS = 
+{ 
+	"MyFloatS", nullptr, (EPropertyFlags)0x0020080000000000, 
+}
+
+const UECodeGen_Private::FFloatPropertyParams Z_Construct_UClass_AMyActor_Statics::NewProp_MyFloat = 
+{ 
+	"MyFloat", nullptr, (EPropertyFlags)0x0020080000000020, 
+}
+```
+
+带有 `Replicated`标记的变量 的Flag 包含 `CPF_Net`.
+```cpp
+CPF_Net	= 0x0000000000000020,	///< Property is relevant to network replication.
+```
+
+检查标记:<br>
+```cpp
+DOREPLIFETIME(AMyActor,MyInt);
+```
+
+宏展开结果:
+```cpp
+static_assert(ValidateReplicatedClassInheritance<AMyActor, ThisClass>(), "AMyActor" "." "MyInt" " is not accessible from this class."); 
+		
+FProperty* ReplicatedProperty = GetReplicatedProperty(StaticClass(), AMyActor::StaticClass(), 
+((void)sizeof(UEAsserts_Private::GetMemberNameCheckedJunk(((AMyActor*)0)->MyInt)), FName(L"MyInt"))); 
+
+RegisterReplicatedLifetimeProperty(ReplicatedProperty, OutLifetimeProps, 
+FixupParams<decltype(AMyActor::MyInt)>(FDoRepLifetimeParams())); 
+```
+
+`GetReplicatedProperty` 检查是否有 `CPF_Net` 标记 ，如果没有标记 直接致命崩溃 : 
+```cpp
+FProperty* GetReplicatedProperty(const UClass* CallingClass, const UClass* PropClass, const FName& PropName)
+{
+	FProperty* TheProperty = FindFieldChecked<FProperty>(PropClass, PropName);
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+	if (!(TheProperty->PropertyFlags & CPF_Net))
+	{
+		UE_LOG(LogNet, Fatal,TEXT("Attempt to replicate property '%s' that was not tagged to replicate! Please use 'Replicated' or 'ReplicatedUsing' keyword in the UPROPERTY() declaration."), *TheProperty->GetFullName());
+	}
+#endif
+	return TheProperty;
+}
+```
+
+---
+对比 普通函数 服务器函数 客户端函数.
+```cpp
+UFUNCTION()
+void MyFuncS(int32 Value);
+
+UFUNCTION(Server,Reliable)
+void ServerFunc(int32 Value);
+	
+void ServerFunc_Implementation(int32 Value);
+
+UFUNCTION(Client,Unreliable)
+void ClientFunc(int32 Value);
+	
+void ClientFunc_Implementation(int32 Value);
+```
+
+UHT结果:
+```cpp
+DEFINE_FUNCTION(AMyActor::execClientFunc)
+{
+	P_GET_PROPERTY(FIntProperty,Z_Param_Value);
+	P_FINISH;
+	P_NATIVE_BEGIN;
+	P_THIS->ClientFunc_Implementation(Z_Param_Value);
+	P_NATIVE_END;
+}
+
+DEFINE_FUNCTION(AMyActor::execServerFunc)
+{
+	P_GET_PROPERTY(FIntProperty,Z_Param_Value);
+	P_FINISH;
+	P_NATIVE_BEGIN;
+	P_THIS->ServerFunc_Implementation(Z_Param_Value);
+	P_NATIVE_END;
+}
+
+DEFINE_FUNCTION(AMyActor::execMyFuncS)
+{
+	P_GET_PROPERTY(FIntProperty,Z_Param_Value);
+	P_FINISH;
+	P_NATIVE_BEGIN;
+	P_THIS->MyFuncS(Z_Param_Value);
+	P_NATIVE_END;
+}
+
+static FName NAME_AMyActor_ClientFunc = FName(TEXT("ClientFunc"));
+void AMyActor::ClientFunc(int32 Value)
+{
+	MyActor_eventClientFunc_Parms Parms;
+	Parms.Value=Value;
+	ProcessEvent(FindFunctionChecked(NAME_AMyActor_ClientFunc),&Parms);
+}
+
+static FName NAME_AMyActor_ServerFunc = FName(TEXT("ServerFunc"));
+void AMyActor::ServerFunc(int32 Value)
+{
+	MyActor_eventServerFunc_Parms Parms;
+	Parms.Value=Value;
+	ProcessEvent(FindFunctionChecked(NAME_AMyActor_ServerFunc),&Parms);
+}
+```
+
+所以 在调用 `ServerFunc(value)` 时， 实际上是执行 `ServerFunc_Implementation`.
+
+ServerFunc 的标记:
+```
+(EFunctionFlags)0x00280CC0  // FUNC_Net | FUNC_NetServer | FUNC_NetReliable | FUNC_Public | ...
+```
+
+ClientFunc 的标记:
+```
+(EFunctionFlags)0x01080C40  // FUNC_Net | FUNC_NetClient | FUNC_NetUnreliable | ...
+```
+
+验证标记:
+```cpp
+bool FObjectReplicator::ReceivedRPC(FNetBitReader& Reader, const FReplicationFlags& RepFlags, const FFieldNetCache* FieldCache, const bool bCanDelayRPC, bool& bOutDelayRPC, TSet<FNetworkGUID>& UnmappedGuids)
+{
+	if (Function == nullptr)
+	{
+		UE_LOG(LogNet, Error, TEXT("ReceivedRPC: Function not found. Object: %s, Function: %s"), *Object->GetFullName(), *FunctionName.ToString());
+		HANDLE_INCOMPATIBLE_RPC
+	}
+
+	if ((Function->FunctionFlags & FUNC_Net) == 0)
+	{
+		UE_LOG(LogRep, Error, TEXT("Rejected non RPC function. Object: %s, Function: %s"), *Object->GetFullName(), *FunctionName.ToString());
+		HANDLE_INCOMPATIBLE_RPC
+	}
+
+	if ((Function->FunctionFlags & (bIsServer ? FUNC_NetServer : (FUNC_NetClient | FUNC_NetMulticast))) == 0)
+	{
+		UE_LOG(LogRep, Error, TEXT("Rejected RPC function due to access rights. Object: %s, Function: %s"), *Object->GetFullName(), *FunctionName.ToString());
+		HANDLE_INCOMPATIBLE_RPC
+	}
+}
+```
+
+`ReceivedRPC` 的调用链:
+```cpp
+void UActorChannel::ProcessBunch( FInBunch & Bunch )
+{
+	Replicator->ReceivedBunch( Reader, RepFlags, bHasRepLayout, bHasUnmapped)
+}
+
+bool FObjectReplicator::ReceivedBunch(FNetBitReader& Bunch, const FReplicationFlags& RepFlags, const bool bHasRepLayout, bool& bOutHasUnmapped)
+{
+	else if ( Cast<UFunction>( FieldCache->Field.ToUObject() ) )
+	{
+		bool bDelayFunction = false;
+		TSet<FNetworkGUID> UnmappedGuids;
+		bool bSuccess = ReceivedRPC(Reader, RepFlags, FieldCache, bCanDelayRPCs, bDelayFunction, UnmappedGuids);
+	}
+}
+```
+
+---
+##### 复制Actor
+
+```cpp
+/**
+ * 调用此函数以将相关 Actor 复制到此 NetDriver 所包含的连接上。
+ *
+ * 根据 Engine.NetClientTicksPerSecond 的限制，尽可能多地处理客户端。
+ * 首先构建一个用于相关性检查的 Actor 列表，
+ * 然后针对每个连接，尝试复制该连接相关的每个 Actor，直到该连接达到饱和状态。
+ *
+ * NetClientTicksPerSecond 用于限制每帧更新的客户端数量，以避免占满服务器的上行带宽，
+ * 尽管当前解决方案远非最优。理想情况下，限流应基于服务器连接是否饱和，
+ * 当饱和时，每个连接将仅进行优先级更新，并在多个 tick 中分散处理。
+ * 另外，可能还需考虑消除那些已成功复制到部分通道但未复制到所有通道的 Actor 的冗余相关性检查，
+ * 这将是一个不错的 CPU 优化方向。
+ *
+ * @param DeltaSeconds 自上次调用以来经过的时间
+ *
+ * @return 已复制的 Actor 数量
+ */
+ ENGINE_API virtual int32 ServerReplicateActors(float DeltaSeconds);
+ ```
+
+这是每一帧服务器处理网络复制的入口。它的核心任务是：决定哪些 Actor 需要同步给哪些客户端。
+
+服务器每帧的复制主循环 遍历所有连接，收集需要考虑复制的 Actor，决定优先级，并调用每个 Actor 的复制逻辑.
+
+1.筛选活跃连接：遍历 `ClientConnections`，只处理状态正常的客户端。<br>
+2.获取待同步 `Actor` 列表：通过 `NetworkObjectList` 获取当前世界中所有标记为 `bReplicates` 的 `Actor`。<br>
+3.优先级排序与频率过滤：<br>
+并不是每个 `Actor` 每一帧都要同步,引擎会根据 `NetUpdateFrequency`（更新频率）和 `Actor` 距离玩家的远近（相关性）来计算优先级。<br>
+数据结构意义：`FActorPriority` 存储了计算出的优先级，确保带宽有限时，关键物体（如身边的敌人）优先同步。
+
+```cpp
+ServerReplicateActors(DeltaSeconds)
+    │
+    ├─ 1. 准备工作：计算本帧可处理的连接数，更新 ReplicationFrame
+    │
+    ├─ 2. 构建全局候选列表：收集本帧所有准备好复制的 Actor
+    │
+    ├─ 3. 遍历每个客户端连接（限流范围内）
+    │      │
+    │      ├─ 3.1 为连接构建观察者列表（主连接 + 子连接）
+    │      ├─ 3.2 发送移动调整（如有）
+    │      ├─ 3.3 筛选并排序 Actor → 调用 PrioritizeActors
+    │      ├─ 3.4 执行复制 → 调用 ProcessPrioritizedActorsRange
+    │      ├─ 3.5 标记因饱和未处理的 Actor
+    │      └─ 3.6 记录连接已处理帧号
+    │
+    ├─ 4. 轮转连接列表（实现公平调度）
+    │
+    └─ 5. 返回本帧成功复制的 Actor 总数
+```
+
+```cpp
+int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
+{
+    // ─────────────────────────────────────────────────────────
+    // 1. 前置准备
+    //    - 若无客户端连接，直接返回 0
+    //    - 递增全局 ReplicationFrame，用于强制属性比较
+    //    - 计算本帧可处理的连接数（ListenServer 限流 / CVar 限制）
+    // ─────────────────────────────────────────────────────────
+    int32 NumClientsToTick = ServerReplicateActors_PrepConnections(DeltaSeconds);
+    ReplicationFrame++;
+
+    // ─────────────────────────────────────────────────────────
+    // 2. 构建全局候选 Actor 列表 (ConsiderList)
+    //    - 遍历 NetworkObjectList 中的活跃 Actor
+    //    - 检查是否到达下次更新时刻
+    //    - 调用 Actor->CallPreReplication() 让 Actor 准备数据
+    //    - 通过筛选的 Actor 加入 ConsiderList
+    // ─────────────────────────────────────────────────────────
+    TArray<FNetworkObjectInfo*> ConsiderList;
+    ServerReplicateActors_BuildConsiderList(ConsiderList, ServerTickTime);
+
+    // ─────────────────────────────────────────────────────────
+    // 3. 逐连接处理 (仅处理前 NumClientsToTick 个连接)
+    // ─────────────────────────────────────────────────────────
+    for (int32 i = 0; i < ClientConnections.Num(); i++)
+    {
+        UNetConnection* Connection = ClientConnections[i];
+        if (i >= NumClientsToTick) 
+		{
+            // 本帧不处理该连接，但标记相关 Actor 为 bPendingNetUpdate
+            MarkPendingForSkippedConnection(Connection, ConsiderList);
+            continue;
+        }
+
+        if (!Connection->ViewTarget) continue;
+
+        // 3.1 构建该连接的观察者列表 (Viewers)
+        //     包含主连接 + 所有子连接（分屏），用于后续相关性判断
+        TArray<FNetViewer> ConnectionViewers = BuildViewers(Connection);
+
+        // 3.2 发送玩家移动调整（若有）
+        SendClientAdjustments(Connection);
+
+        // 3.3 为该连接筛选并排序 Actor
+        //     - 从 ConsiderList 中挑出相关 Actor（IsNetRelevantFor）
+        //     - 计算每个 Actor 的优先级（距离、时间、视野等）
+        //     - 按优先级降序排列，生成 PriorityActors 列表
+        FActorPriority** PriorityActors;
+        int32 FinalSortedCount = ServerReplicateActors_PrioritizeActors(
+            Connection, ConnectionViewers, ConsiderList,
+            PriorityActors);
+
+        // 3.4 遍历排序后的 Actor，执行实际复制
+        //     - 创建/复用 UActorChannel
+        //     - 调用 Channel->ReplicateActor() 序列化并发送属性
+        //     - 若连接带宽饱和，提前终止
+        int32 LastProcessed = ServerReplicateActors_ProcessPrioritizedActorsRange(Connection, ConnectionViewers, PriorityActors,FinalSortedCount, UpdatedCount);
+
+        // 3.5 标记因饱和而未处理的 Actor 为 bPendingNetUpdate
+        ServerReplicateActors_MarkRelevantActors(Connection, PriorityActors, 
+		LastProcessed, FinalSortedCount);
+
+        // 3.6 记录该连接已在本帧处理
+        Connection->LastProcessedFrame = ReplicationFrame;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 4. 连接列表轮转（公平调度）
+    //    将本帧已处理的前 NumClientsToTick 个连接移到列表末尾，
+    //    确保下一帧优先处理其他连接
+    // ─────────────────────────────────────────────────────────
+    RotateConnectionList(NumClientsToTick);
+
+    // ─────────────────────────────────────────────────────────
+    // 5. 返回本帧成功复制的 Actor 总次数
+    // ─────────────────────────────────────────────────────────
+    return UpdatedCount;
+}
+```
+
+---
+
+调用时机 :
+
+```cpp
+void UNetDriver::TickFlush(float DeltaSeconds)
+{
+	if (IsServer() && ClientConnections.Num() > 0 && !bSkipServerReplicateActors)
+	{
+		int32 Updated = 0;
+		Updated = ServerReplicateActors(DeltaSeconds);
+	}
+}
+```
+
+---
+
+检查要Tick的连接数量.
+```cpp
+int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
+{
+	const int32 NumClientsToTick = ServerReplicateActors_PrepConnections( DeltaSeconds );
+
+	if ( NumClientsToTick == 0 )
+	{
+		// No connections are ready this frame
+		return 0;
+	}
+}
+```
+
+```cpp
+int32 UNetDriver::ServerReplicateActors_PrepConnections( const float DeltaSeconds )
+{
+	int32 NumClientsToTick = ClientConnections.Num();  // 默认全处理
+
+	// 1. Listen Server 或强制限流模式
+	if (bForceClientTickingThrottle || GetNetMode() == NM_ListenServer)
+	{
+    	// 根据期望的每秒客户端更新频率（NetClientTicksPerSecond）和上一帧累积的时间（DeltaTimeOverflow）
+    	// 计算本帧可以处理的客户端数量
+    	NumClientsToTick = FMath::Min(NumClientsToTick, FMath::TruncToInt(ClientUpdatesThisFrame));
+	}
+
+	// 2. 控制台变量限制（net.MaxConnectionsToTickPerServerFrame）
+	if (NetCmds::MaxConnectionsToTickPerServerFrame->GetInt() > 0)
+	{
+    	NumClientsToTick = FMath::Min(NumClientsToTick, NetCmds::MaxConnectionsToTickPerServerFrame->GetInt());
+	}
+	
+	return NumClientsToTick;
+}
+```
+
+
+`ServerReplicateActors_PrepConnections` 还设置了每个连接的`ViewTarget` ，断点调试的信息是玩家控制器所控制的Pawn.
+
+
+---
+收集要复制的 `Actor` : 
+```cpp
+int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
+{
+	TArray<FNetworkObjectInfo*> ConsiderList;
+	ConsiderList.Reserve( GetNetworkObjectList().GetActiveObjects().Num() );
+
+	// Build the consider list (actors that are ready to replicate)
+	ServerReplicateActors_BuildConsiderList( ConsiderList, ServerTickTime );
+
+	for ( int32 i=0; i < ClientConnections.Num(); i++ )
+	{
+		UNetConnection* Connection = ClientConnections[i];
+
+		// if this client shouldn't be ticked this frame
+		if (i >= NumClientsToTick)
+		{
+
+		}
+	}
+}
+```
+遍历每一条网络连接，如果已经超出了 `NumClientsToTick` 的数量 就给它们做一个标记，等待下一次Tick.
 
 
 
+---
+
+注意这里的 `for` ，它正在遍历每一个客户端的连接通道，<br>
+以下内容 只针对单个客户端的说明，实际上 下面的内容会在每一个客户端上重复.
+
+在处理每个客户端时，遍历要复制的 `Actor`，针对单个客户端 遍历这些 `Actor`对应的 `ActorChannel` 进行复制.
+
+```cpp
+int32 UNetDriver::ServerReplicateActors(float DeltaSeconds)
+{
+	for ( int32 i=0; i < ClientConnections.Num(); i++ )
+	{
+		UNetConnection* Connection = ClientConnections[i];
+		if (Connection->ViewTarget)
+		{
+			TArray<FNetViewer>& ConnectionViewers = WorldSettings->ReplicationViewers;
+
+			ConnectionViewers.Reset();
+			new( ConnectionViewers )FNetViewer( Connection, DeltaSeconds );
+
+			FActorPriority* PriorityList = NULL;
+			FActorPriority** PriorityActors = NULL;
+
+			// Get a sorted list of actors for this connection
+			const int32 FinalSortedCount = ServerReplicateActors_PrioritizeActors(Connection, ConnectionViewers, ConsiderList, bCPUSaturated, PriorityList, PriorityActors);
+
+			// Process the sorted list of actors for this connection
+			TInterval<int32> ActorsIndexRange(0, FinalSortedCount);
+			const int32 LastProcessedActor = ServerReplicateActors_ProcessPrioritizedActorsRange(Connection, ConnectionViewers, PriorityActors, ActorsIndexRange, Updated);
+
+			ServerReplicateActors_MarkRelevantActors(Connection, ConnectionViewers, LastProcessedActor, FinalSortedCount, PriorityActors);
+		}
+	}
+}
+```
+
+`FNetViewer` 封装单个观察者的连接、位置、朝向，供相关性计算使用。
+
+`ServerReplicateActors_PrioritizeActors` :<br>
+从候选列表 `ConsiderList` 中挑出对该连接 `相关` 的 `Actor`，计算每个 `Actor` 的优先级，并按优先级降序排列，<br>
+最终返回一个有序的 `Actor` 列表供后续复制使用。
+
+`相关性` 与 `Actor`的`NetCullDistanceSquared`变量 有关.<br>
+`IsNetRelevantFor` `GetNetPriority` 是虚函数，可在子类重写.
+
+`ServerReplicateActors_ProcessPrioritizedActorsRange` : <br>
+
+```cpp
+{
+	if (ActorInfo == NULL && PriorityActors[j]->DestructionInfo)
+	{
+    	// 检查客户端是否已加载该 Actor 所在的流关卡
+    	if (DestructionInfo->StreamingLevelName != NAME_None && 
+        !Connection->ClientVisibleLevelNames.Contains(DestructionInfo->StreamingLevelName))
+        continue;
+
+    	// 发送销毁信息（通过控制通道或临时 Actor 通道）
+    	SendDestructionInfo(Connection, DestructionInfo);
+    
+   	 	// 从连接的待销毁列表中移除
+    	Connection->RemoveDestructionInfo(DestructionInfo);
+    	continue;
+	}
+}
+```
+
+当 `PriorityActors[j]->ActorInfo == nullptr` 且 `DestructionInfo != nullptr` 时，<br>
+表示这是一个需要通知客户端销毁的静态 Actor（或休眠后销毁的 Actor）
+
+**处理正常 Actor 复制 :**
+
+检查相关性并创建/关闭通道 : 
+
+`Channel->Connection`	指向创建它的那个 `UNetConnection`，即当前正在处理的客户端连接。<br>
+`Channel->Actor`	指向它负责同步的 `AActor`。<br>
+`Channel->ChIndex`	在该连接上的唯一通道索引（0 是控制通道，>0 是 Actor 通道）。<br>
+
+如果一个 `Actor` 需要被复制给 `3` 个不同的客户端，那么服务器上会存在 `3` 条不同的 `UActorChannel` 实例：<br>
+通道 A：归属于 Connection1 和该 Actor。<br>
+通道 B：归属于 Connection2 和该 Actor。<br>
+通道 C：归属于 Connection3 和该 Actor。<br>
+
+```cpp
+AActor* Actor = ActorInfo->Actor;
+UActorChannel* Channel = PriorityActors[j]->Channel;
+bool bIsRelevant = false;
+
+if (bLevelInitializedForActor)  // 客户端已加载该 Actor 所在关卡
+{
+    if (!Actor->GetTearOff() && (!Channel || ElapsedTime - Channel->RelevantTime > 1.0))
+    {
+        // 超过 1 秒未检查相关性，重新评估
+        bIsRelevant = IsActorRelevantToConnection(Actor, ConnectionViewers);
+    }
+}
+else
+{
+    // 关卡未加载，标记为不相关
+    bIsRelevant = false;
+}
+
+const bool bIsRecentlyRelevant = bIsRelevant 
+	|| (Channel && ElapsedTime - Channel->RelevantTime < RelevantTimeout) 
+	|| (ActorInfo->ForceRelevantFrame >= Connection->LastProcessedFrame);
+```
+
+若最近相关，创建通道 :
+```cpp
+if (bIsRecentlyRelevant)
+{
+    if (Channel == NULL && GuidCache->SupportsObject(...) && bLevelInitializedForActor)
+    {
+        Channel = (UActorChannel*)Connection->CreateChannelByName(NAME_Actor, EChannelCreateFlags::OpenedLocally);
+        if (Channel)
+        {
+			Channel->SetChannelActor(Actor, ESetChannelActorFlags::None);
+		}
+    }
+}
+```
+
+若通道存在且连接未饱和，执行复制 :
+```cpp
+if (Channel)
+{
+    if (bIsRelevant)
+    {
+		Channel->RelevantTime = ElapsedTime + 0.5 * UpdateDelayRandomStream.FRand();  // 延长通道存活时间
+	}
+
+    if (Channel->IsNetReady(0) || bIgnoreSaturation)
+    {
+        if (Channel->ReplicateActor())   // 核心：属性序列化与发送
+        {
+            ActorUpdatesThisConnectionSent++;
+            // 更新 ActorInfo 中的最后复制时间和最优更新间隔
+            ActorInfo->LastNetReplicateTime = World->TimeSeconds;
+            // 根据实际复制间隔调整 OptimalNetUpdateDelta（自适应频率）
+        }
+        ActorUpdatesThisConnection++;
+        OutUpdated++;
+    }
+    else
+    {
+        // 通道饱和，强制该 Actor 下一帧再次尝试
+        Actor->ForceNetUpdate();
+    }
+
+    // 再次检查连接是否饱和，若是则提前退出循环
+    if (!Connection->IsNetReady(0) && !bIgnoreSaturation)
+    {
+        GNumSaturatedConnections++;
+        return j;   // 返回当前索引，后续 Actor 本帧不再处理
+    }
+}
+```
+
+`Channel->ReplicateActor()` 这里是核心部分，下一节分析.
+
+若不相关且存在通道，关闭通道:
+```cpp
+else if ((!bIsRecentlyRelevant || Actor->GetTearOff()) && Channel != NULL)
+{
+    if (!bLevelInitializedForActor || !Actor->IsNetStartupActor())
+        Channel->Close(Actor->GetTearOff() ? EChannelCloseReason::TearOff : EChannelCloseReason::Relevancy);
+}
+```
 
 
+
+---
+
+##### ActorChannel
+
+```cpp
+UActorChannel::ReplicateActor()
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. 检查 Actor 是否有效、通道是否关闭、是否暂停等待 ACK                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. 若是首次复制 (OpenPacketId.First == INDEX_NONE)                           │
+│    - 调用 PackageMap->SerializeNewActor，发送 Actor 创建信息                   │
+│    - 包括类路径、网络 GUID、初始位置等                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. 复制 Actor 自身属性                                                        │
+│    - ActorReplicator->ReplicateProperties(Bunch, RepFlags)                   │
+│    - 通过 FRepLayout 比较当前值与历史值，仅序列化变化的属性                      │
+│    - 若使用 Push Model，仅复制标记为脏的属性                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. 复制子对象 (SubObject)                                                     │
+│    - 遍历 Actor 的注册子对象列表 (或调用 ReplicateSubobjects)                  │
+│    - 对每个子对象执行类似的属性复制                                            │
+│    - 处理已删除的子对象 (发送销毁通知)                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 5. 发送 Bunch                                                                │
+│    - 若写入了任何数据 (bWroteSomethingImportant)，调用 SendBunch              │
+│    - SendBunch 将数据加入可靠/不可靠队列，最终通过 Connection 发送 UDP 包       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                         返回是否实际发送了数据 (bool)
+```
+
+`ActorChannel::ReplicateActor` 是由 `NetDriver`的Tick驱动的，
+
+处理每一个客户端连接时，遍历服务器上面要复制的 `Actor`，使用这些 `Actor` 对应的 `ActorChannel` 进行复制.
+
+```cpp
+UActorChannel::ReplicateActor
+    │
+    ├─ 设置 FReplicationFlags
+    ├─ 如果是新 Actor → SerializeNewActor (创建信息)
+    │
+    ├─ ActorReplicator->ReplicateProperties
+    │      │
+    │      ├─ UpdateChangelistMgr (检测变化)
+    │      ├─ RepLayout->ReplicateProperties (普通属性)
+    │      ├─ ReplicateCustomDeltaProperties (FastArray等)
+    │      └─ 序列化排队的 RPC
+    │
+    ├─ DoSubObjectReplication
+    │      └─ 对每个子对象调用 WriteSubObjectInBunch
+    │             └─ 子对象的 ReplicateProperties (同上)
+    │
+    ├─ UpdateDeletedSubObjects (发送删除通知)
+    │
+    └─ SendBunch (打包并发送)
+           │
+           └─ UNetConnection::SendRawBunch
+                 └─ 写入 SendBuffer
+                 └─ FlushNet → LowLevelSend (发送到客户端)
+```
+
+速通 :
+```cpp
+int64 UActorChannel::ReplicateActor()
+{
+    // 前置检查：Actor 有效、通道未关闭、不是 replay 等
+    // 创建 FOutBunch（输出数据块）
+    FOutBunch Bunch(this, 0);
+
+    // 设置 RepFlags（复制标志：bNetInitial、bNetOwner、bNetSimulated 等）
+    FReplicationFlags RepFlags;
+
+    // 如果通道刚打开，设置 bNetInitial = true
+    if (RepFlags.bNetInitial && OpenedLocally) 
+	{
+        Connection->PackageMap->SerializeNewActor(Bunch, this, Actor);
+    }
+
+    // 调用 ActorReplicator 复制属性
+    ActorReplicator->ReplicateProperties(Bunch, RepFlags);
+
+    // 复制子对象（Components、Subobjects）
+    DoSubObjectReplication(Bunch, RepFlags);
+
+    // 处理删除的子对象
+    UpdateDeletedSubObjects(Bunch);
+
+    // 如果写入了任何重要数据，调用 SendBunch 发送
+    if (bWroteSomethingImportant) 
+	{
+        SendBunch(&Bunch, 1);
+    }
+    return NumBitsWrote;
+}
+```
+
+```cpp
+/**
+ * 序列化新 Actor 的标准方法。
+ *     对于静态 Actor，只需调用一次 SerializeObject，因为它们可以通过路径名直接引用。
+ *     对于动态 Actor，首先序列化该 Actor 的引用，但由于客户端尚未生成该 Actor，该引用在客户端无法解析。
+ *     随后会序列化该 Actor 的原型（archetype），以及初始位置、旋转和速度。
+ *     客户端读取这些信息后，会在 NetDriver 所属的 World 中生成该 Actor，并为其赋予在函数开头读取到的 NetGUID。
+ *
+ *     若新生成了一个 Actor，则返回 true；若根据 NetGUID 找到了已存在的 Actor，则返回 false。
+ */
+bool UPackageMapClient::SerializeNewActor(FArchive& Ar, class UActorChannel *Channel, class AActor*& Actor)
+```
+
+---
+
+##### 属性复制
+
+
+主要发生在 UActorChannel::ReplicateActor 内部.
+
+1.准备阶段 :<br>
+每个通道都有一个 `FObjectReplicator`，它是属性复制的具体执行者,<br>
+它持有 `FRepLayout`（类的内存布局图）和 `FRepState`（该连接的同步状态备份）。
+
+2.对比阶段：<br>
+`CompareProperties` :<br>
+`Shadow Buffer`：`FRepState` 中存储了一块和 `Actor` 属性大小完全一致的内存，记录的是“上一次发送成功后的值”。<br>
+执行对比：调用 `FRepLayout::CompareProperties`,<br>
+它按照预先计算好的偏移量，将 `Actor` 当前的内存与 `Shadow Buffer` 进行 `memcmp` 比较。
+
+`FRepLayout` 就像是一张索引表，它把复杂的 C++ 类结构扁平化成一系列 `Cmd`。<br>
+这样对比时就不需要反射，直接根据偏移量操作内存，效率极高。
+
+3.序列化阶段：<br>
+一旦对比出差异，就会生成一个变更列表 `Changelist`,<br>
+发送数据：遍历变更列表，调用属性的序列化函数，将变化后的值写进 FNetBitWriter（比特流缓冲）。<br>
+`Ack`：数据发出去后，服务器并不会立即更新影子内存，而是等待客户端的回传确认包。<br>
+
+
+
+---
+
+```cpp
+bool FObjectReplicator::ReplicateProperties_r(FOutBunch& Bunch, FReplicationFlags RepFlags, FNetBitWriter& Writer)
+{
+    // 1. 更新变更列表管理器（检测哪些属性变化了）
+    FNetSerializeCB::UpdateChangelistMgr(*RepLayout, SendingRepState, *ChangelistMgr, Object, 
+	Connection->Driver->ReplicationFrame, RepFlags, bForceCompare);
+    
+	// 2. 通过 RepLayout 复制普通属性
+    const bool bHasRepLayout = RepLayout->ReplicateProperties(SendingRepState, ChangelistState, 
+    (uint8*)Object, ObjectClass, OwningChannel, Writer, RepFlags);
+
+    // 3. 复制自定义 Delta 属性（如 FastArray）
+    ReplicateCustomDeltaProperties(Writer, RepFlags, bSkippedPropertyCondition);
+
+    // 4. 复制排队的 RPC
+    if (RemoteFunctions && RemoteFunctions->GetNumBits() > 0) 
+	{
+        Writer.SerializeBits(RemoteFunctions->GetData(), RemoteFunctions->GetNumBits());
+    }
+
+    // 5. 如果写入了数据，将整个 Writer 作为内容块写入 Bunch
+    if (Writer.GetNumBits() != 0) 
+	{
+        OwningChannel->WriteContentBlockPayload(Object, Bunch, bHasRepLayout, Writer);
+        return true;
+    }
+    return false;
+}
+```
+
+状态对比:
+`UpdateChangelistMgr` : 
+
+共享状态优化（避免每连接重复对比）:
+
+```cpp
+ERepLayoutResult Result = ERepLayoutResult::Success;
+ // 条件：非强制对比 && 共享状态 && 非初始复制 && 该连接已对比过至少一次 && 本帧已对比过
+if (!bForceCompare && GShareShadowState && !RepFlags.bNetInitial && 
+        RepState->LastCompareIndex > 1 && InChangelistMgr.LastReplicationFrame == ReplicationFrame)
+{
+    INC_DWORD_STAT_BY(STAT_NetSkippedDynamicProps, 1);
+    return Result;
+}
+	
+Result = CompareProperties(RepState, &InChangelistMgr.RepChangelistState, (const uint8*)InObject, RepFlags);
+```
+
+如果同一帧内已有其他连接对该对象进行了对比，则当前连接可以复用结果（除角色属性外，因为 RemoteRole 可能因连接而异）。
+
+执行属性对比:<br>
+`CompareProperties`
+```cpp
+ERepLayoutResult FRepLayout::CompareProperties(/*...*/) const
+{
+	CompareParentProperties(SharedParams, StackParams);
+}
+
+static void CompareParentProperties(/*...*/)
+{
+	for (int32 ParentIndex = 0; ParentIndex < SharedParams.Parents.Num(); ++ParentIndex)
+	{
+		UE_RepLayout_Private::CompareParentPropertyHelper(ParentIndex, SharedParams, StackParams);
+	}
+}
+```
+最终来到了这里 :
+```cpp
+static bool CompareParentProperty(/*...*/)
+{
+	// Note, Handle - 1 to account for CompareProperties_r incrementing handles.
+	CompareProperties_r(SharedParams, StackParams, Parent.CmdStart, Parent.CmdEnd, Cmd.RelativeHandle - 1);
+}
+
+static uint16 CompareProperties_r(/*...*/)
+{
+	if (!PropertiesAreIdentical(Cmd, ShadowData.Data, Data.Data, SharedParams.NetSerializeLayouts))
+	{
+		StoreProperty(Cmd, ShadowData.Data, Data.Data);
+		StackParams.Changed.Add(Handle);
+	}
+}
+```
+
+`PropertiesAreIdentical` 里面就是一堆的 `CompareValue`.
+
+
+---
+
+##### RPC
+
+```
+ *	示例：客户端向服务器发送 RPC。
+ *		- 客户端调用 Server_RPC。
+ *		- 该请求（通过 NetDriver 和 NetConnection）被转发到拥有调用 RPC 的 Actor 的 Actor Channel。
+ *		- Actor Channel 将 RPC 标识符和参数序列化到一个 Bunch 中。该 Bunch 还将包含其 Actor Channel 的 ID。
+ *		- Actor Channel 然后请求 NetConnection 发送该 Bunch。
+ *		- 稍后，NetConnection 将此（和其他）数据组装到一个 Packet 中，并将其发送到服务器。
+ *		- 在服务器上，Packet 被 NetDriver 接收。
+ *		- NetDriver 检查发送 Packet 的地址，并将 Packet 交给适当的 NetConnection。
+ *		- NetConnection 将 Packet 拆分为其 Bunches（一个接一个）。
+ *		- NetConnection 使用 Bunch 上的 Channel ID 将 Bunch 路由到相应的 Actor Channel。
+ *		- ActorChannel 然后拆解 Bunch，看到它包含 RPC 数据，并使用 RPC ID 和序列化的参数
+ *			在 Actor 上调用相应的函数。
+```
+
+UHT那一节展示了服务器/客户端函数的标记 以及生产的函数:
+
+ServerFunc 的标记 :
+```
+(EFunctionFlags)0x00280CC0  // FUNC_Net | FUNC_NetServer | FUNC_NetReliable | FUNC_Public | ...
+```
+
+ClientFunc 的标记 :
+```
+(EFunctionFlags)0x01080C40  // FUNC_Net | FUNC_NetClient | FUNC_NetUnreliable | ...
+```
+
+```cpp
+static FName NAME_AMyActor_ClientFunc = FName(TEXT("ClientFunc"));
+void AMyActor::ClientFunc(int32 Value)
+{
+	MyActor_eventClientFunc_Parms Parms;
+	Parms.Value=Value;
+	ProcessEvent(FindFunctionChecked(NAME_AMyActor_ClientFunc),&Parms);
+}
+```
+执行远程函数 :
+```cpp
+/*-----------------------------
+			Virtual Machine
+	-----------------------------*/
+
+/** Called by VM to execute a UFunction with a filled in UStruct of parameters */
+virtual void ProcessEvent( UFunction* Function, void* Parms )
+{
+	if (FunctionCallspace & FunctionCallspace::Remote)
+	{
+		CallRemoteFunction(Function, Parms, NULL, NULL);
+	}
+}
+```
+
+
+```cpp
+bool AActor::CallRemoteFunction( UFunction* Function, void* Parameters, 
+FOutParmRec* OutParms, FFrame* Stack )
+{
+	for (FNamedNetDriver& Driver : Context->ActiveNetDrivers)
+	{
+		if (Driver.NetDriver != nullptr && Driver.NetDriver->ShouldReplicateFunction(this, Function))
+		{
+			Driver.NetDriver->ProcessRemoteFunction(this, Function, Parameters, 
+			OutParms, Stack, nullptr);
+
+			bProcessed = true;
+		}
+	}
+}
+```
+
+---
+
+#### Lyra网络
 

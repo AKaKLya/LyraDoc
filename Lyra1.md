@@ -918,6 +918,8 @@ void UGameFrameworkComponentManager::CreateComponentOnInstance(AActor* ActorInst
 
 ![alt text](Lyra1/img/image-15.png)
 
+---
+
 #### AddAbility
 `UGameFrameworkComponentManager`扩展系统:
 ```cpp
@@ -1030,457 +1032,247 @@ void UGameFeatureAction_AddAbilities::HandleActorExtension(AActor* Actor, FName 
 }
 ```
 
-#### 资产 
-##### Bundle
-Bundle（资源包）是 Unreal Engine 中按需加载的资源分组系统。就像手机 APP 的资源分包：
-- 默认 Bundle：核心资源，必须加载
-- Client Bundle：客户端专用资源（UI、音效、特效）
-- Server Bundle：服务器专用资源（AI、逻辑）
-- 平台特定 Bundle：如 Android、iOS 特定资源
-- 质量级别 Bundle：Low、Medium、High 画质资源
+---
 
-```cpp
-// 传统方式：所有资源一起加载
-LoadAsset("/Game/Characters/Hero/BP_Hero.uasset");
+### Audio
 
-// Bundle方式：按需加载
-ActivateBundle("Client");  // 只加载客户端需要的资源
-ActivateBundle("Server");  // 只加载服务器需要的资源
-```
 
-```cpp
-// 每个资产可以有多个Bundle标签
-// 就像一个文件可以有多个标签（标签系统）
 
-// 例子：角色资产"Hero"
-// Bundle标签：["", "Client", "HighQuality", "PC"]
-
-// 例子：武器资产"Sword"  
-// Bundle标签：["", "Client", "LowQuality", "Mobile"]
-
-// 当前资产标签："", "Client"
-ChangeBundleStateForPrimaryAssets(
-    { AssetId_Hero },      // 对Hero资产
-    { "HighQuality" },     // 添加"HighQuality"标签
-    { "Client" }           // 移除"Client"标签
-);
-
-// 结果：Hero的Bundle标签变为 ["", "HighQuality"]
-
-//------------------------------------------------------//
-
-// 把每个资产看作一行，每个Bundle看作一列
-// 这个函数就是同时对多个资产的多个Bundle进行操作
-
-// 假设有3个资产，3个可能的Bundle
-Asset1: [B1, B2, B3]
-Asset2: [B1, B2, B3] 
-Asset3: [B1, B2, B3]
-
-// 调用：
-AssetsToChange = [Asset1, Asset2]  // 操作前两个资产
-AddBundles = [B2]                  // 给它们都添加B2
-RemoveBundles = [B1]               // 从它们都移除B1
-
-// 结果：
-Asset1: [B2, B3]    // 移除了B1，添加了B2（如果已存在B2则不变）
-Asset2: [B2, B3]
-Asset3: [B1, B2, B3] // 不变，因为不在AssetsToChange中
-```
-
--------
-
-```cpp
-// 1. 创建Bundle列表（加载"Equipped"）
-TArray<FName> BundlesToLoad;
-BundlesToLoad.Add(FName("Equipped")); 
-
-// 2. 根据网络角色添加Bundle
-if (bLoadClient) 
-{
-    BundlesToLoad.Add(UGameFeaturesSubsystemSettings::LoadStateClient);
-}
-if (bLoadServer) 
-{
-    BundlesToLoad.Add(UGameFeaturesSubsystemSettings::LoadStateServer);
-}
-
-// 3. 创建资产列表
-TSet<FPrimaryAssetId> BundleAssetList;
-BundleAssetList.Add(CurrentExperience->GetPrimaryAssetId());
-// ... 添加ActionSets
-
-// 4. 调用ChangeBundleStateForPrimaryAssets
-BundleLoadHandle = AssetManager.ChangeBundleStateForPrimaryAssets(
-    BundleAssetList.Array(),  // 资产列表
-    BundlesToLoad,           // 要添加的Bundle
-    {},                      // 不移除的Bundle
-    false,                   // 不移除所有Bundle
-    FStreamableDelegate(),   // 回调
-    FStreamableManager::AsyncLoadHighPriority  // 优先级
-);
-```
-初始化
-```cpp
-// 假设当前体验定义：
-// 资产ID: "LyraExperience.MainMenu"
-// 包含2个ActionSets:
-//   "LyraActionSet.MenuUI"
-//   "LyraActionSet.MenuAudio"
-
-// 局部变量初始化后：
-BundleAssetList = 
-{
-    "LyraExperience.MainMenu",
-    "LyraActionSet.MenuUI", 
-    "LyraActionSet.MenuAudio"
-}
-
-// 网络判断：假设是客户端 (bLoadClient = true, bLoadServer = false)
-BundlesToLoad = 
-{
-    "Equipped",      // 首先添加的
-    "Client"         // 因为bLoadClient为true而添加
-}
-
-//---------ChangeBundleStateForPrimaryAssets---------//
-
-// 调用前：引擎内部状态（假设）
-// 注意：这是引擎管理的状态，不是局部变量
-
-// 资产 "LyraExperience.MainMenu" 当前激活的Bundle: []
-// 资产 "LyraActionSet.MenuUI" 当前激活的Bundle: []
-// 资产 "LyraActionSet.MenuAudio" 当前激活的Bundle: []
-
-// 函数调用：
-AssetManager.ChangeBundleStateForPrimaryAssets
-(
-    ["LyraExperience.MainMenu", "LyraActionSet.MenuUI", "LyraActionSet.MenuAudio"], // AssetsToChange
-    ["Equipped", "Client"],  // AddBundles
-    [],                      // RemoveBundles
-    false,                   // bRemoveAllBundles
-    ...                      // 其他参数
-);
-
-// 调用后：引擎内部状态（变化了）
-
-// 资产 "LyraExperience.MainMenu" 现在激活的Bundle: ["Equipped", "Client"]
-// 资产 "LyraActionSet.MenuUI" 现在激活的Bundle: ["Equipped", "Client"]
-// 资产 "LyraActionSet.MenuAudio" 现在激活的Bundle: ["Equipped", "Client"]
-
-```
-
-时间线
-```cpp
-// 时间线表示：
-t0: 调用ChangeBundleStateForPrimaryAssets之前
-    资产状态：无激活Bundle（或上次体验的Bundle）
-    内存：无相关资源加载
-
-t1: ChangeBundleStateForPrimaryAssets执行中
-    1. 为每个资产添加"Equipped"和"Client"标签
-    2. 计算需要加载的资源列表
-    3. 开始异步加载
-
-t2: 资源加载开始（异步）
-    内存：开始加载"Equipped"和"Client" Bundle的资源
-
-t3: 资源加载完成
-    内存：所有相关资源已加载
-    游戏：可以正常使用这些资源
-```
-
+---
 
 ### LyraAssetManager
-LyraAssetManager 是 Lyra 游戏框架对 UE5 AssetManager 的扩展实现，主要解决以下问题：
-- 游戏特定资源管理：提供游戏专用的资源加载、缓存和管理逻辑
-- 启动流程控制：管理游戏启动时的异步资源加载，支持进度报告
-- 资源生命周期管理：确保关键游戏资源常驻内存，避免运行时加载卡顿
-- 编辑器与运行时差异化处理：针对不同运行环境优化加载策略
 
-```cpp
-UAssetManager (基类)
-    ↓
-ULyraAssetManager (Lyra扩展)
-    ├── 启动任务系统 (FLyraAssetManagerStartupJob)
-    ├── 游戏数据管理 (GameDataMap)
-    ├── 资源缓存系统 (LoadedAssets)
-    └── 进度报告机制
-```
+`AssetManager` 是一个单例类，负责在运行时管理资产的加载、卸载和查询。
+
+它是解决大型项目“内存管理”和“按需加载”的核心工具。<br>
+默认情况下，UE 会加载所有硬引用的资产，而 `AssetManager` 允许通过软引用和异步加载来精确控制资源。
+
+
+简单来说，如果把游戏资产比作图书馆里的书，`AssetManager` 就是那个手里拿着索引目录、知道哪本书该放在哪个架子上，并且负责决定什么时候把书从仓库搬进阅览室的高级管理员。
+
+`AssetManager` 是 UE Cook和打包流程的核心。<br>
+它负责将资产分配到不同的 Chunks数据块 中。这对于制作补丁、DLC 或移动端的分步下载至关重要。
+
 ---
-#### FLyraAssetManagerStartupJob 
-- 封装异步加载任务，支持进度跟踪
-- 通过权重系统计算整体加载进度百分比
-- 限制进度更新频率（60fps），避免性能开销
 
+`AssetManager` 允许定义 `PrimaryAssetTypes`。<br>
+可以在项目设置中告诉它：去扫描这个文件夹下所有的 `DataAsset`，把它们标记为`武器`类型。<br>
+好处: 不需要手动引用每一个文件，`AssetManager` 会在后台自动生成一个包含所有相关资产的列表。
+
+`PrimaryAsset`： 具有唯一 ID(`FPrimaryAssetId`)的资产。<br>
+可以通过这个 ID 直接告诉 `AssetManager`：“帮我加载 ID 为 `Item:HealingPotion` 的资产”。
+
+通过使用 `PrimaryAssetId`，可以在不创建硬引用的情况下加载资产。
+
+硬引用： A 引用 B，加载 A 时必须加载 B。这会导致内存链式反应。<br>
+软引用： A 只知道 B 的地址。`AssetManager` 可以根据需要，在特定时刻异步加载 B。
+
+---
+
+`PrimaryAssetId` : <br>
+将某个对象标识为一种`主要`资产，该资产可被 `AssetManager` 搜索到，并能在各种工具中使用。
+
+这个ID可以追溯到`UObject` : 
 ```cpp
-struct FLyraAssetManagerStartupJob
-{
-    FLyraAssetManagerStartupJobSubstepProgress SubstepProgressDelegate; // 进度报告委托
-    TFunction<void(const FLyraAssetManagerStartupJob&, TSharedPtr<FStreamableHandle>&)> JobFunc; // 任务函数
-    FString JobName;  // 任务名称（用于日志）
-    float JobWeight;  // 任务权重（用于进度计算）
-    mutable double LastUpdate = 0; // 上次更新时间（用于限制更新频率）
-};
-```
-`DoJob`
-- 性能监控：使用 FPlatformTime::Seconds() 记录任务耗时
-- 异步支持：通过 FStreamableHandle 支持异步加载
-- 进度绑定：将异步加载进度与任务进度报告绑定
-```cpp
-TSharedPtr<FStreamableHandle> FLyraAssetManagerStartupJob::DoJob() const
-{
-    const double JobStartTime = FPlatformTime::Seconds(); // 记录开始时间
-    TSharedPtr<FStreamableHandle> Handle;
-    UE_LOG(LogLyra, Display, TEXT("Startup job \"%s\" starting"), *JobName);
-    JobFunc(*this, Handle); // 执行实际任务函数
-    
-    if (Handle.IsValid()) // 如果创建了异步句柄
-    {
-        // 绑定进度更新委托
-        Handle->BindUpdateDelegate(FStreamableUpdateDelegate::CreateRaw(
-            this, &FLyraAssetManagerStartupJob::UpdateSubstepProgressFromStreamable));
-        Handle->WaitUntilComplete(0.0f, false); // 等待完成（非阻塞式等待）
-        Handle->BindUpdateDelegate(FStreamableUpdateDelegate()); // 解绑委托
-    }
-    
-    UE_LOG(LogLyra, Display, TEXT("Startup job \"%s\" took %.2f seconds to complete"), 
-           *JobName, FPlatformTime::Seconds() - JobStartTime);
-    return Handle;
-}
-```
-
-在Lyra中 这个类提供了一个可以异步的任务，但是在实际使用中和直接调用函数没有什么区别:
-```cpp
-void ULyraAssetManager::StartInitialLoading()
-{
-    SCOPED_BOOT_TIMING("ULyraAssetManager::StartInitialLoading");
-
-    // This does all of the scanning, need to do this now even if loads are deferred
-    Super::StartInitialLoading();
-    InitializeGameplayCueManager();
-    GetGameData();
-}
-```
-
-
-
-```cpp
-UPrimaryDataAsset* ULyraAssetManager::LoadGameDataOfClass(
-    TSubclassOf<UPrimaryDataAsset> DataClass,           // 要加载的数据类
-    const TSoftObjectPtr<UPrimaryDataAsset>& DataClassPath, // 资源的软引用路径
-    FPrimaryAssetType PrimaryAssetType)                 // 主资产类型
-{
-    if (GIsEditor)  // 检查是否在编辑器中运行
-    {
-        Asset = DataClassPath.LoadSynchronous();  // 同步阻塞加载
-        LoadPrimaryAssetsWithType(PrimaryAssetType);  // 加载该类型的所有主资产
-    }
-    else  // 非编辑器运行时（游戏打包后）
-    {
-        TSharedPtr<FStreamableHandle> Handle = LoadPrimaryAssetsWithType(PrimaryAssetType);
-        if (Handle.IsValid())
-        {
-            Handle->WaitUntilComplete(0.0f, false);  // 等待异步加载完成
-            Asset = Cast<UPrimaryDataAsset>(Handle->GetLoadedAsset());  // 获取加载的资产
-        }
-    }
-}
+/**
+* 返回一个“类型：名称”的配对信息，代表此对象的“主资产标识符”。
+* 在运行时需要进行全局引用的资产应返回有效的标识符。
+* 如果有效，则可以使用“资产管理器”通过标识符来引用该对象。*/
+virtual FPrimaryAssetId GetPrimaryAssetId() const;
 ```
 
 ---
-`GetAsset`
-```cpp
-// Assets loaded and tracked by the asset manager. 防止垃圾回收
-UPROPERTY()
-TSet<TObjectPtr<const UObject>> LoadedAssets;
 
-// Returns the asset referenced by a TSoftObjectPtr.  This will synchronously load the asset if it's notalready loaded.
+#### 软引用的Get
+`TryLoad`:尝试加载该资源，这将调用 `LoadObject` 函数，该函数的执行可能会非常缓慢
+```cpp
+TSoftObjectPtr<UMyObject> AssetPointer;
+FSoftObjectPath AssetPath = AssetPointer.ToSoftObjectPath();
+UObject* LoadedObject = AssetPath.TryLoad();
+
+UMyObject* MyClass = Cast<UMyObject>(LoadedObject);
+```
+
+`TryLoad` 通过路径加载`Object`:<br>
+`StaticLoadObject`的第二个参数是`Outer` 但这里传入`nullptr`.
+```cpp
+FString PathString = ToString();
+LoadedObject = StaticLoadObject(UObject::StaticClass(), nullptr, *PathString, nullptr, LOAD_None, nullptr, true);
+```
+
+`StaticLoadObject` 又转发了一层：
+```cpp
+UObject* StaticLoadObject(UClass* ObjectClass, UObject* InOuter, const TCHAR* InName /*...*/)
+{
+    UObject* Result = StaticLoadObjectInternal(ObjectClass, InOuter, InName/*...*/);
+    return Result;
+}
+```
+
+在前面传入的`Outer`都是`nullptr`，`Internal`将会构造一个`Outer`:<br>
+简单来说，如果给它 `/Game/Meshes/Hero.Hero`：<br>
+`InPackage`: 指向 `/Game/Meshes/Hero` 这个包对象的指针。<br>
+`InOutName`: 变成字符串 `Hero`。
+```cpp
+UObject* StaticLoadObjectInternal(UClass* ObjectClass, UObject* InOuter, const TCHAR* InName /*...*/)
+{
+    uint32 LoadFlag = (LOAD_EditorOnly | LOAD_NoVerify | LOAD_Quiet | LOAD_NoWarn | LOAD_DeferDependencyLoads);
+
+    FString StrName = InName;
+
+    // break up the name into packages, returning the innermost name and its outer
+    ResolveName(InOuter, StrName, true, true, LoadFlag, nullptr);
+
+    if (InOuter)
+	{
+        Result = StaticFindObjectFast(ObjectClass, InOuter, *StrName);
+    }
+
+    return Result.
+}
+```
+如果找到了 就将`Result`返回. 这里的`Outer`实际上是`Package`.
+
+`StaticFindObjectFast` 根据`ObjectClass InOuter StrName`从`GUObjectArray`里面查找对应的`UObject`.<br>
+最后的`StrName` 就是软引用存放的路径:
+```cpp
+TSoftObjectPtr<UMyObject> AssetPointer;
+FSoftObjectPath AssetPath = AssetPointer.ToSoftObjectPath();
+FString StrName = AssetPath.ToString;
+```
+
+---
+
+如果没有找到`Result`？
+```cpp
+UObject* StaticLoadObjectInternal(UClass* ObjectClass, UObject* InOuter, const TCHAR* InName /*...*/)
+{
+    uint32 LoadFlag = (LOAD_EditorOnly | LOAD_NoVerify | LOAD_Quiet | LOAD_NoWarn | LOAD_DeferDependencyLoads);
+
+    FString StrName = InName;
+
+    // break up the name into packages, returning the innermost name and its outer
+    ResolveName(InOuter, StrName, true, true, LoadFlag, nullptr);
+
+    if (InOuter)
+	{
+        Result = StaticFindObjectFast(ObjectClass, InOuter, *StrName);
+    }
+
+    if (!Result)
+	{
+		if (!InOuter->GetOutermost()->HasAnyPackageFlags(PKG_CompiledIn))
+		{
+			// now that we have one asset per package, we load the entire package whenever a single object is requested
+			LoadPackage(NULL, *InOuter->GetOutermost()->GetName(), LoadFlags & ~LOAD_Verify, nullptr, InstancingContext);
+		}
+
+		// now, find the object in the package
+		Result = StaticFindObjectFast(ObjectClass, InOuter, *StrName);
+    }
+    return Result.
+}
+```
+
+在`LoadPackage`中，使用`NewObject`创建一个`Package`，<br>
+而`NewObject`会将创建出来的`Object`塞入`GUObjectArray`.
+
+于是这样就闭环了，下次再加载这个`Object`就能从`GUObjectArray`中快速获取，而不需要再次创建`Package`.
+
+借用`SpwanActor`的图， 说明`NewObject`的流程:
+
+![alt text](Meta/img1/SpawnActor.png)
+
+
+---
+`LyraAssetManager`的`GetAsset`使用了两种加载方式: 第二个`return`就是上文的软引用加载方式.
+```cpp
+return UAssetManager::GetStreamableManager().LoadSynchronous(AssetPath, false);
+return AssetPath.TryLoad();
+```
+
+`LoadSynchronous`维护了一个`TMap StreamableItems`,记录了所有通过此管理器加载过的资产状态。<br>
+如果资产已经在异步加载中（`bAsyncLoadRequestOutstanding`），它会聪明地感知到并等待，而不是开启第二次`IO`。
+
+`AssetPath.TryLoad()`:没有这个缓存层,每次都会直接调用 `StaticLoadObject`。<br>
+虽然 `StaticLoadObject` 内部也会查 `GUObjectArray`，但它无法管理“正在异步加载中”的对象，容易导致冗余的加载尝试。
+
+
+`AssetPath.TryLoad()` 像是手动去仓库翻货，翻到什么算什么。<br>
+`UAssetManager::LoadSynchronous` 像是通过现代物流系统下单，系统会检查货物是否在途（异步加载中）、是否换了包装（重定向）、是否还没拆封（AsyncLoading 标志），确保送到手里的是完全可用的成品。
+
+---
+
+**防止GC :**<br>
+```cpp
 template<typename AssetType>
-static AssetType* GetAsset(const TSoftObjectPtr<AssetType>& AssetPointer, bool bKeepInMemory = true);
-```
-- 如果`AssetPointer`没有加载，则会同步加载 - `SynchronousLoadAsset`
-- bKeepInMemory 是否将加载的资源保持在内存中，如果为true，则会将资源添加到LoadedAssets中，防止GC回收.
-- 返回加载的资源指针
-
-
-`GetSubclass`
-```cpp
-GetAsset:
-const TSoftObjectPtr<AssetType>& AssetPointer
-// TSoftObjectPtr<T> - 用于引用普通资产实例
-// 示例：TSoftObjectPtr<UTexture2D> 引用一个纹理
-
-AssetType*  // 返回具体类型的指针
-// 示例：UTexture2D* 直接指向纹理对象
-
--------------------------------------------------
-GetSubclass:
-const TSoftClassPtr<AssetType>& AssetPointer
-// TSoftClassPtr<T> - 用于引用类/蓝图资产
-// 示例：TSoftClassPtr<ACharacter> 引用一个角色类或蓝图
-
-TSubclassOf<AssetType>  // 实际上是 UClass*，但有类型安全包装
-// 示例：TSubclassOf<ACharacter> 可以安全转换为 ACharacter::StaticClass() 或其子类
-```
-
-资产实例和类资产
-```cpp
-// 资产实例 - 具体的数据对象
-UObject* AssetInstance = LoadObject<UTexture2D>(nullptr, TEXT("/Game/Textures/MyTexture"));
-
-// 类资产 - 用于创建实例的蓝图
-UClass* ClassAsset = LoadClass<ACharacter>(nullptr, TEXT("/Game/Blueprints/BP_MyCharacter"));
-
-// 使用差异：
-UTexture2D* Texture = AssetInstance;  // 直接使用
-ACharacter* Character = GetWorld()->SpawnActor<ACharacter>(ClassAsset);  // 用于创建实例
-```
-
-
-|方面	|GetAsset|	GetSubclass
-| --- | --- | --- |
-输入类型|	TSoftObjectPtr<T>|	TSoftClassPtr<T>
-返回类型|	T* (具体指针)|	TSubclassOf<T> (类型安全类引用)
-加载目标|	资产实例（数据）	|类资产（用于创建实例）
-转换方式|	Cast<T>()|	Cast<UClass>()
-主要用途|	获取可直接使用的资源|	获取用于生成对象的蓝图类
-
-
-`Override`的函数
-```cpp
-//~UAssetManager interface
-    virtual void StartInitialLoading() override;
-#if WITH_EDITOR
-    virtual void PreBeginPIE(bool bStartSimulate) override;
-#endif
-    //~End of UAssetManager interface
-```
-
-```cpp
-void ULyraAssetManager::StartInitialLoading()
+AssetType* ULyraAssetManager::GetAsset(const TSoftObjectPtr<AssetType>& AssetPointer, bool bKeepInMemory)
 {
-    SCOPED_BOOT_TIMING("ULyraAssetManager::StartInitialLoading");
+	AssetType* LoadedAsset = nullptr;
+    /*...*/
+	if (AssetPath.IsValid())
+	{
+		/*...*/
+		if (LoadedAsset && bKeepInMemory)
+		{
+			// Added to loaded asset list.
+			Get().AddLoadedAsset(Cast<UObject>(LoadedAsset));
+		}
+	}
 
-    // This does all of the scanning, need to do this now even if loads are deferred
-    Super::StartInitialLoading();
-    
-    InitializeGameplayCueManager();
-    GetGameData();
-}
-```
-`InitializeGameplayCueManager()` ?
-```cpp
-void ULyraAssetManager::InitializeGameplayCueManager()
-{
-    SCOPED_BOOT_TIMING("ULyraAssetManager::InitializeGameplayCueManager");
-
-    ULyraGameplayCueManager* GCM = ULyraGameplayCueManager::Get();
-    check(GCM);
-    GCM->LoadAlwaysLoadedCues();
+	return LoadedAsset;
 }
 
-void ULyraGameplayCueManager::LoadAlwaysLoadedCues()
+void ULyraAssetManager::AddLoadedAsset(const UObject* Asset)
 {
-    if (ShouldDelayLoadGameplayCues())
-    {
-        UGameplayTagsManager& TagManager = UGameplayTagsManager::Get();
-    
-        //@TODO: Try to collect these by filtering GameplayCue. tags out of native gameplay tags?
-        TArray<FName> AdditionalAlwaysLoadedCueTags;
-
-        // ？
-        for (const FName& CueTagName : AdditionalAlwaysLoadedCueTags)
-        {
-            //省略
-        }
-    }
-}
-```
-`GetGameData`
-
-先检查是否已经加载过，如果没有加载过 ---> 加载并保存到GameDataMap.
-```cpp
-UPROPERTY(Transient)
-TMap<TObjectPtr<UClass>, TObjectPtr<UPrimaryDataAsset>> GameDataMap;
-
-// 方案1：直接存储实例
-TArray<TObjectPtr<UPrimaryDataAsset>> GameDataMap;
-// 问题：如何查找特定类型的资产？
-// 需要遍历 + 类型检查
-for (auto& Asset : GameDataAssets)
-{
-    if (Asset->GetClass() == ULyraGameData::StaticClass())
-    {
-        // 找到了，但还需要Cast
-    }
+	if (ensureAlways(Asset))
+	{
+		FScopeLock LoadedAssetsLock(&LoadedAssetsCritical);
+		LoadedAssets.Add(Asset);
+	}
 }
 
------------------------------------
-
-// 方案2：使用类作为键的映射
-TMap<TObjectPtr<UClass>, TObjectPtr<UPrimaryDataAsset>> GameDataMap;
-
-// 查找：O(1)时间复杂度
-auto* Asset = GameDataMap.Find(ULyraGameData::StaticClass());
-if (Asset)
+class ULyraAssetManager : public UAssetManager
 {
-    // 直接使用，类型安全
-}
-
-// 设计原则：每种类型只应该有一个主要实例
-// 例如：
-// - ULyraGameData::StaticClass() -> 唯一的 ULyraGameData 实例
-// - ULyraPawnData::StaticClass() -> 唯一的 ULyraPawnData 实例
-```
-
-```cpp
-const ULyraGameData& ULyraAssetManager::GetGameData()
-{
-    if (TObjectPtr<UPrimaryDataAsset> const * pResult = GameDataMap.Find(ULyraGameData::StaticClass()))
-    {
-        return *CastChecked<ULyraGameData>(*pResult);
-    }
-
-    // Does a blocking load if needed
-    return *CastChecked<const ULyraGameData>(LoadGameDataOfClass(ULyraGameData::StaticClass(), 
-    LyraGameDataPath,ULyraGameData::StaticClass()->GetFName()));
-}
-
-UPrimaryDataAsset* ULyraAssetManager::LoadGameDataOfClass(
-    TSubclassOf<UPrimaryDataAsset> DataClass,            // 要加载的数据类的类型
-    const TSoftObjectPtr<UPrimaryDataAsset>& DataClassPath, // 资源的软引用路径
-    FPrimaryAssetType PrimaryAssetType)                  // 主资产类型标识
-{
-    //省略
-    if (GIsEditor)
-    {
-        Asset = DataClassPath.LoadSynchronous();  // 同步阻塞加载
-        LoadPrimaryAssetsWithType(PrimaryAssetType);  // 额外加载同类型资产,确保整个类型的所有资产都被加载.
-    }
-    else
-    {
-        TSharedPtr<FStreamableHandle> Handle = LoadPrimaryAssetsWithType(PrimaryAssetType);
-        if (Handle.IsValid())
-        {
-            Handle->WaitUntilComplete(0.0f, false);  // 0.0f 无限等待时间，非阻塞等待
-            Asset = Cast<UPrimaryDataAsset>(Handle->GetLoadedAsset());
-        }
-    }
-
-    if (Asset)
-    {
-        GameDataMap.Add(DataClass, Asset);
-    }
+ private:
+	// Assets loaded and tracked by the asset manager.
+	UPROPERTY()
+	TSet<TObjectPtr<const UObject>> LoadedAssets;
 }
 ```
 
-`DefaultGame.ini`
-```ini
-[/Script/LyraGame.LyraAssetManager]
-LyraGameDataPath=/Game/DefaultGameData.DefaultGameData
-DefaultPawnData=/Game/Characters/Heroes/EmptyPawnData/DefaultPawnData_EmptyPawn.DefaultPawnData_EmptyPawn
-```
+垃圾回收器会从“根对象”（Root）开始遍历。<br>
+如果一个 UObject 没有被任何标记了 `UPROPERTY()` 的变量引用，它就会被判定为“不可达”，从而在下一波 GC 中被从 `GUObjectArray` 里清理掉。
+
+当传入 `bKeepInMemory = true` 时，该资源被塞进了 `LoadedAssets` 这个 `TSet` 中。<br>
+因为 `ULyraAssetManager` 自身是一个单例且常驻内存的 `UObject`，它持有的 `TSet` 里的所有对象都会被视为被强引用引用中。
+
+---
+
+#### 资源缓存
+
+对于频繁使用的资源，例如 伤害GE，每次造成伤害都需要这个GE，所以 提前加载一手.<br>
+
+
+![alt text](Lyra1/img4/GameData.png)
+
+在引擎启动阶段，`UAssetManager::StartInitialLoading()` 的行为：<br>
+读取 `DefaultEngine.ini` 中 `[/Script/Engine.AssetManagerSettings]` 下的 `PrimaryAssetTypesToScan` 数组。<br>
+对每个 `FPrimaryAssetTypeInfo` 调用 `ScanPathsForPrimaryAssets`：<br>
+记录类型信息（基类、蓝图标记、扫描路径）。<br>
+若 `AssetRegistry` 尚未加载完成，则延迟扫描；否则立即从 `AssetRegistry` 中查询所有匹配的 `FAssetData`。<br>
+
+将查询到的资产信息存入内部数据结构：<br>
+`AssetTypeMap`：类型 → 类型数据（包含资产名称到 `FPrimaryAssetData` 的映射）。<br>
+`AssetPathMap`：对象路径 → `FPrimaryAssetId`。<br>
+缓存资产的 `Bundle` 数据等。<br>
+
+整个过程仅扫描并建立索引，不实际加载任何资产，以保证启动速度。
+
+
+
+
+---
 
 ### Gameplay
 
@@ -5514,6 +5306,7 @@ virtual void OnGameplayEffectExecuted(FActiveGameplayEffectsContainer& ActiveGEC
 调用时机：效果初始应用或堆叠时
 不包括：周期性执行、复制传播
 推荐使用：优先使用此函数而非上述两个
+但根据具体情况，也可以同时使用多个函数.
 */
 virtual void OnGameplayEffectApplied(FActiveGameplayEffectsContainer& ActiveGEContainer,FGameplayEffectSpec& GESpec,FPredictionKey& PredictionKey) const
 ```
@@ -6119,7 +5912,8 @@ bool UTargetTagRequirementsGameplayEffectComponent::OnActiveGameplayEffectAdded(
 ---
 
 ##### TargetTagsGameplayEffectComponent
-向所属GE添加一个标签.
+向所属GE添加一个标签.<br>
+这个标签最终会传到ASC的`GameplayTagCountContainer`.
 ```cpp
 void UTargetTagsGameplayEffectComponent::OnGameplayEffectChanged() const
 {
