@@ -6,6 +6,6 @@
 
 [Lyra 第二卷](Lyra2.md) - UI
 
-[Lyra 第三卷](Lyra3,md) - 网络
-
 [虚幻宇宙](Meta.md)
+
+[GAS复刻Paragon](Paragon.md)
