@@ -1031,7 +1031,9 @@ UUserWidget& UGameSettingListView::OnGenerateEntryWidgetInternal(UObject* Item, 
 
 #### GameSetting
 
-以上只是UI创建显示的过程，还没有分析实际的按钮功能.
+以上只是UI创建显示的过程.
+
+
 
 
 

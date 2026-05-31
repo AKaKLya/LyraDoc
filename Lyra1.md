@@ -6,7 +6,7 @@
 ---
 
 ## Editor
-### 快速蓝图类创建
+### 快速创建蓝图类
 ![alt text](Lyra1/img/image.png)
 ![alt text](Lyra1/img/image-1.png)
 
@@ -411,7 +411,230 @@ struct FLyraVerbMessage
 };
 ```
 
+---
 
+#### AsyncAction 与 动态委托
+
+`UAsyncAction_ListenForGameplayMessage::Activate` 向 `UGameplayMessageSubsystem` 注册了事件，<br>
+当有事件传来时，就执行 `UAsyncAction_ListenForGameplayMessage::HandleMessageReceived` .
+
+问 这个`AsyncAction`的生命周期是怎样的 ? 
+
+在每次调用`HandleMessageReceived` 时，都会判断`OnMessageReceived`绑定的事件是否有效.
+
+```cpp
+void UAsyncAction_ListenForGameplayMessage::HandleMessageReceived(FGameplayTag Channel, const UScriptStruct* StructType, const void* Payload)
+{
+    /*...*/
+	OnMessageReceived.Broadcast(this, Channel);
+	/*...*/
+
+	if (!OnMessageReceived.IsBound())
+	{
+		// If the BP object that created the async node is destroyed, OnMessageReceived will be unbound after calling the broadcast.
+		// In this case we can safely mark this receiver as ready for destruction.
+		// Need to support a more proactive mechanism for cleanup FORT-340994
+		SetReadyToDestroy();
+	}
+}
+```
+下面是 `Broadcast` 实际上调用的函数 : 
+```cpp
+// AsyncAction_ListenForGameplayMessage.gen.cpp
+void FAsyncGameplayMessageDelegate_DelegateWrapper(const FMulticastScriptDelegate& AsyncGameplayMessageDelegate, 
+UAsyncAction_ListenForGameplayMessage* ProxyObject, FGameplayTag ActualChannel)
+{
+	struct _Script_GameplayMessageRuntime_eventAsyncGameplayMessageDelegate_Parms
+	{
+		UAsyncAction_ListenForGameplayMessage* ProxyObject;
+		FGameplayTag ActualChannel;
+	};
+	_Script_GameplayMessageRuntime_eventAsyncGameplayMessageDelegate_Parms Parms;
+	Parms.ProxyObject=ProxyObject;
+	Parms.ActualChannel=ActualChannel;
+	AsyncGameplayMessageDelegate.ProcessMulticastDelegate<UObject>(&Parms);
+}
+
+// Engine\Source\Runtime\Core\Public\UObject\ScriptDelegates.h
+template <class UObjectTemplate>
+void ProcessMulticastDelegate(void* Parameters) const
+{
+	if( InvocationList.Num() > 0 )
+	{
+		// Create a copy of the invocation list, just in case the list is modified by one of the callbacks during the broadcast
+		using FInlineInvocationList = TArray< UnicastDelegateType, TInlineAllocator<4>>;
+		FInlineInvocationList InvocationListCopy = FInlineInvocationList(InvocationList);
+	
+		for( typename FInlineInvocationList::TConstIterator FunctionIt( InvocationListCopy ); FunctionIt; ++FunctionIt )
+		{
+			if( FunctionIt->IsBound() )
+			{
+				FunctionIt->template ProcessDelegate<UObjectTemplate>(Parameters);
+			}
+			else if ( FunctionIt->IsCompactable() )
+			{
+				RemoveInternal( *FunctionIt );
+			}
+		}
+	}
+}
+```
+`FunctionIt` 保存的类型是 `TScriptDelegate` :
+```cpp
+using UnicastDelegateType = TScriptDelegate</*..*/>;
+
+template <typename InThreadSafetyMode>
+class TScriptDelegate : public TDelegateAccessHandlerBase<typename UE::Core::Private::TScriptDelegateTraits<InThreadSafetyMode>::ThreadSafetyMode>
+{
+    /** Default constructor. */
+	TScriptDelegate() 
+		: Object( nullptr )
+		, FunctionName( NAME_None )
+	{ }
+
+    /** The object bound to this delegate, or nullptr if no object is bound */
+	WeakPtrType Object;
+
+	/** Name of the function to call on the bound object */
+	FName FunctionName;
+}
+```
+`TScriptDelegate` 保存了`UObject` 和 函数名称, `WeakPtrType Object` 其实就是 `FWeakObjectPtr Object`.<br>
+
+
+```cpp
+if( FunctionIt->IsBound() )
+{
+	FunctionIt->template ProcessDelegate<UObjectTemplate>(Parameters);
+}
+else if ( FunctionIt->IsCompactable() )
+{
+	RemoveInternal( *FunctionIt );
+}
+```
+`IsBound` 的行为: 判断函数名称不为空，Object有效.
+```cpp
+/** 
+* Checks to see if the user object bound to this delegate is still valid
+*
+* @return  True if the object is still valid and it's safe to execute the function call
+*/
+inline bool IsBound() const
+{
+	FReadAccessScope ReadScope = GetReadAccessScope();
+	return IsBound_Internal<UObject>();
+}
+
+template <class UObjectTemplate>
+inline bool IsBound_Internal() const
+{
+	if (FunctionName != NAME_None)
+	{
+		if (UObject* ObjectPtr = Object.Get())
+		{
+			return ((UObjectTemplate*)ObjectPtr)->FindFunction(FunctionName) != nullptr;
+		}
+	}
+
+	return false;
+}
+```
+
+`IsCompactable` 的行为:判断是否可以移除.
+
+```cpp
+/** 
+* Checks to see if the user object bound to this delegate will ever be valid again
+*
+* @return  True if the object is still valid and it's safe to execute the function call
+ */
+inline bool IsCompactable() const
+{
+	FReadAccessScope ReadScope = GetReadAccessScope();
+	return FunctionName == NAME_None || !Object.Get(true);
+}
+```
+
+如果可以移除的话 就将其从 `InvocationList` 里面移除 :
+```cpp
+void RemoveInternal( const UnicastDelegateType& InDelegate ) const
+{
+	InvocationList.RemoveSingleSwap(InDelegate);
+}
+```
+
+---
+整理一下前文的内容.
+```cpp
+void UAsyncAction_ListenForGameplayMessage::HandleMessageReceived(FGameplayTag Channel, const UScriptStruct* StructType, const void* Payload)
+{
+    /*...*/
+	OnMessageReceived.Broadcast(this, Channel);
+	/*...*/
+
+	if (!OnMessageReceived.IsBound())
+	{
+		// If the BP object that created the async node is destroyed, OnMessageReceived will be unbound after calling the broadcast.
+		// In this case we can safely mark this receiver as ready for destruction.
+		// Need to support a more proactive mechanism for cleanup FORT-340994
+		SetReadyToDestroy();
+	}
+}
+```
+
+`HandleMessageReceived` 在调用`Broadcast`时，<br>
+`OnMessageReceived` 的内部会判断绑定是否有效，判断依据是 `UObject`依然存在 并且 绑定的 `FunctionName` 有效.
+
+这里的`UObject`使用`FWeakObjectPtr`来保存，指向的是 `GUObjectArray` 这个全局数组中的位置.<br>
+
+如果判断绑定有效，那么就执行委托.<br>
+如果判断绑定无效，则从 `InvocationList` 里面 删除这个委托.
+
+`if (!OnMessageReceived.IsBound())` : 判断 `InvocationList` 是否为空.
+```cpp
+/**
+* Checks to see if any functions are bound to this multi-cast delegate
+*
+* @return	True if any functions are bound
+*/
+inline bool IsBound() const
+{
+	FReadAccessScope ReadScope = GetReadAccessScope();
+	return InvocationList.Num() > 0;
+}
+```
+
+如果是空的话，那么就执行 `SetReadyToDestroy`，准备销毁这个 `AsyncAction`.
+
+这就要求 `MessageSubsystem` 有事件传过来才行，<br>
+一旦接收到消息 并且发现绑定已经无效了，才会去执行 `SetReadyToDestroy`.
+
+---
+
+绑定GC事件，在GC之前 检查绑定的委托是否有效 :
+```cpp
+void UAsyncAction_ListenForGameplayMessage::Activate()
+{
+	if (UWorld* World = WorldPtr.Get())
+	{
+		if (UGameplayMessageSubsystem::HasInstance(World))
+		{
+			GCHandle = FCoreUObjectDelegates::GetPreGarbageCollectDelegate().AddUObject(this,&ThisClass::OnPreGC);
+            /*...*/
+        }
+    }
+}
+
+void UAsyncAction_ListenForGameplayMessage::OnPreGC()
+{
+	if (!OnMessageReceived.IsBound())
+	{
+		FCoreUObjectDelegates::GetPreGarbageCollectDelegate().Remove(GCHandle);
+		GCHandle.Reset();
+		SetReadyToDestroy();
+	}
+}
+```
 
 ---
 
@@ -3533,7 +3756,7 @@ PostGameplayEffectExecute
 ---
 
 
-##### Tick
+##### Tick ?
 
 `UAttributeSet` 是`UObject`类，本身就可以`Tick`.
 
@@ -3876,7 +4099,9 @@ Handle UAbilitySystemComponent::ApplyGameplayEffectSpecToSelf(const FGameplayEff
 无限持续的GE 不会修改 `BaseValue`，而是修改 `CurrentValue`，<br>
 因为预测而撤销的GE 会将属性值恢复为 `BaseValue`，<br>
 
-Instant的GE会修改`BaseValue`，就算因为预测撤销了，也无法还原应用GE之前正确的值.
+Instant的GE会修改`BaseValue`，就算因为预测撤销了，也无法还原应用GE之前正确的值.<br>
+
+所以 `bTreatAsInfiniteDuration` 会将Instant的GE 修改为无限持续，以支持预测机制.
 
 ---
 应用GE : 
@@ -4458,7 +4683,560 @@ void UAbilitySystemComponent::ExecuteGameplayEffect(FGameplayEffectSpec &Spec, F
 
 最后调用`UGameplayEffect::OnExecuted`-> `UGameplayEffectComponent::OnGameplayEffectExecuted`.
 
+---
 
+##### 添加技能
+
+```
+ROLE_Authority：服务器端（包括专用服务器和监听服务器的主机角色）
+ROLE_AutonomousProxy：客户端上自己控制的角色
+ROLE_SimulatedProxy：客户端上其他玩家的角色
+```
+
+```
+LocalOnly：GA仅在本地执行（不通过网络）.通常用于纯客户端效果，如 UI 动画.
+LocalPredicted：客户端预测执行，同时服务器也会执行，最终以服务器为准.
+
+ServerOnly：GA仅在服务器执行，客户端从不执行.
+ServerInitiated：GA由服务器触发，但客户端也会执行（例如服务器通知所有客户端播放一个技能）.
+```
+
+玩家在不同主机上的身份 :
+
+|运行位置|玩家A|玩家B|玩家C|
+|---|---|---|---|
+|服务器|ROLE_Authority|ROLE_Authority|ROLE_Authority|
+|客户端A|ROLE_AutonomousProxy|ROLE_SimulatedProxy|ROLE_SimulatedProxy|
+|客户端B|ROLE_SimulatedProxy|ROLE_AutonomousProxy|ROLE_SimulatedProxy|
+|客户端C|ROLE_SimulatedProxy|ROLE_SimulatedProxy|ROLE_AutonomousProxy|
+
+---
+
+
+```cpp
+UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Gameplay Abilities", meta = (DisplayName = "Give Ability", ScriptName = "GiveAbility"))
+FGameplayAbilitySpecHandle K2_GiveAbility(TSubclassOf<UGameplayAbility> AbilityClass, int32 Level = 0, int32 InputID = -1);
+```
+
+`BlueprintAuthorityOnly` : 只有 Server, Dedicated Server 或者 单机游戏 ，才能调用这个函数.<br>
+所以 客户端是无法添加技能的.
+
+```cpp
+FGameplayAbilitySpecHandle UAbilitySystemComponent::K2_GiveAbility(TSubclassOf<UGameplayAbility> AbilityClass, int32 Level /*= 0*/, int32 InputID /*= -1*/)
+{
+	// build and validate the ability spec
+	FGameplayAbilitySpec AbilitySpec = FGameplayAbilitySpec(AbilityClass, Level, InputID);
+
+    /*...*/
+
+	// grant the ability and return the handle. This will run validation and authority checks
+	return GiveAbility(AbilitySpec);
+}
+```
+
+`AbilitySpec` 保存了`Ability` 的CDO对象 (见构造函数).
+
+```cpp
+FGameplayAbilitySpecHandle UAbilitySystemComponent::GiveAbility(const FGameplayAbilitySpec& Spec)
+{
+    if (!IsValid(Spec.Ability)) /*...*/
+
+    if (!IsOwnerActorAuthoritative())
+	{
+		ABILITY_LOG(Error, TEXT("GiveAbility called on ability %s on the client, not allowed!"), *Spec.Ability->GetName());
+
+		return FGameplayAbilitySpecHandle();
+	}
+
+    FGameplayAbilitySpec& OwnedSpec = ActivatableAbilities.Items[ActivatableAbilities.Items.Add(Spec)];
+    
+    if (OwnedSpec.Ability->GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::InstancedPerActor)
+	{
+		// Create the instance at creation time
+		CreateNewInstanceOfAbility(OwnedSpec, Spec.Ability);
+	}
+
+    OnGiveAbility(OwnedSpec);
+	MarkAbilitySpecDirty(OwnedSpec, true);
+
+	return OwnedSpec.Handle;
+}
+
+UPROPERTY(ReplicatedUsing = OnRep_ActivateAbilities, BlueprintReadOnly, Transient, Category = "Abilities")
+FGameplayAbilitySpecContainer ActivatableAbilities;
+
+struct FGameplayAbilitySpecContainer : public FFastArraySerializer 
+```
+
+即使直接调用`GiveAbility` 也会检查有没有权限.<br>
+`ActivatableAbilities` 是可以网络复制的，在添加技能后 将其标记为dirty.
+
+之后，通过网络复制 把技能发送给客户端.
+```cpp
+USTRUCT(BlueprintType)
+struct FGameplayAbilitySpecContainer : public FFastArraySerializer
+{
+    /** List of activatable abilities */
+	UPROPERTY()
+	TArray<FGameplayAbilitySpec> Items;
+
+	/** Component that owns this list */
+	UPROPERTY(NotReplicated)
+	TObjectPtr<UAbilitySystemComponent> Owner;
+
+    bool NetDeltaSerialize(FNetDeltaSerializeInfo & DeltaParms)
+	{
+		return FFastArraySerializer::FastArrayDeltaSerialize<FGameplayAbilitySpec, FGameplayAbilitySpecContainer>(Items, DeltaParms, *this);
+	}
+}
+```
+
+---
+
+实例化的复制
+
+假设有一个 传送 的GA，它是 `InstancedPerActor` 的，并且由服务器执行：
+
+```cpp
+// TeleportAbility.h
+UCLASS()
+class UTeleportAbility : public UGameplayAbility
+{
+    GENERATED_BODY()
+
+public:
+    // InstancedPerActor：每个Actor只有一个实例
+    // ReplicateYes：服务器创建的实例要同步到客户端
+    UTeleportAbility()
+    {
+        InstancingPolicy = EGameplayAbilityInstancingPolicy::InstancedPerActor;
+        ReplicationPolicy = EGameplayAbilityReplicationPolicy::ReplicateYes;
+        NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerInitiated;
+    }
+
+    // 这个变量需要在能力实例中被追踪，并在客户端可见
+    UPROPERTY(Replicated)
+    FVector TeleportTargetLocation;
+
+    // 用于延迟传送后的回调
+    FTimerHandle TeleportCooldownTimer;
+
+    virtual void ActivateAbility(...) override
+    {
+        // 服务器设置传送目标位置
+        TeleportTargetLocation = GetTargetLocation();
+
+        // 这个Timer是实例级别的状态，客户端需要知道它在运行
+        GetWorld()->GetTimerManager().SetTimer(TeleportCooldownTimer, this, 
+            &UTeleportAbility::OnTeleportComplete,0.5f
+        );
+
+        // 执行传送...
+    }
+};
+```
+如果用 `ReplicateNo`，客户端会自己创建一个不同的实例：
+
+```cpp
+// 如果 ReplicateNo，OnGiveAbility 时
+if (Spec.NonReplicatedInstances.Num() == 0)
+{
+    // 客户端自己创建实例
+    CreateNewInstanceOfAbility(Spec, SpecAbility);
+}
+
+// 此时：
+// 服务器实例: TeleportTargetLocation = (100, 200, 300)
+// 客户端实例: TeleportTargetLocation = (0, 0, 0)  ← 未初始化
+// 两个不同对象，客户端看不到服务器的状态
+```
+
+需要 `ReplicateYes` 的场景特征是：
+
+- GA的实例 包含需要 `Replicated` 同步的变量.
+- 客户端需要看到服务器的实例状态，获得一些必要的数据.
+- GA的实例 生命周期跨越多个网络更新，不是一次性执行完.
+
+如果GA的所有逻辑只在激活瞬间完成，不需要在实例上维护状态，那就用 `ReplicateNo` 更合适。
+
+---
+
+GA实例化 :
+
+```cpp
+void UAbilitySystemComponent::OnGiveAbility(FGameplayAbilitySpec& Spec)
+{
+    const UGameplayAbility* SpecAbility = Spec.Ability;
+	if (SpecAbility->GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::InstancedPerActor && SpecAbility->GetReplicationPolicy() == EGameplayAbilityReplicationPolicy::ReplicateNo)
+	{
+		// If we don't replicate and are missing an instance, add one
+		if (Spec.NonReplicatedInstances.Num() == 0)
+		{
+			CreateNewInstanceOfAbility(Spec, SpecAbility);
+		}
+	}
+}
+
+UGameplayAbility* UAbilitySystemComponent::CreateNewInstanceOfAbility(FGameplayAbilitySpec& Spec, const UGameplayAbility* Ability)
+{
+    UGameplayAbility * AbilityInstance = NewObject<UGameplayAbility>(Owner, Ability->GetClass());
+
+    // Add it to one of our instance lists so that it doesn't GC.
+	if (AbilityInstance->GetReplicationPolicy() != EGameplayAbilityReplicationPolicy::ReplicateNo)
+	{
+		Spec.ReplicatedInstances.Add(AbilityInstance);
+		AddReplicatedInstancedAbility(AbilityInstance);
+	}
+	else
+	{
+		Spec.NonReplicatedInstances.Add(AbilityInstance);
+	}
+    return AbilityInstance;
+}
+```
+
+虽然 `ReplicatedInstances` 没有标记 `Replicated` ，但是实际上 它所在的数组是会复制的.<br>
+前文写了 `ActivatableAbilities` 是可以网络复制的数组，因此 `ReplicatedInstances` 不是通过网络反序列化来的，而是由 `PostReplicatedAdd` 在接收端本地创建并填充的。
+
+
+---
+
+```cpp
+void UAbilitySystemComponent::OnGiveAbility(FGameplayAbilitySpec& Spec)
+{
+    // If this Ability Spec specified that it was created from an Active Gameplay Effect, then link the handle to the Active Gameplay Effect.
+    if (Spec.GameplayEffectHandle.IsValid())
+    {
+        FActiveGameplayEffect* SourceActiveGE = SourceASC->ActiveGameplayEffects.GetActiveGameplayEffect(Spec.GameplayEffectHandle);
+        SourceActiveGE->GrantedAbilityHandles.AddUnique(Spec.Handle);
+    }
+}
+```
+
+如果这个GA来自GE，就将这个GA与GE绑定起来，添加到GE的 `GrantedAbilityHandles` 里面，<br>
+`GetGrantedByEffectContext` 和 `RemoveGrantedByEffect` 可以通过GA 反查GE.
+
+`UAbilitiesGameplayEffectComponent` 依靠这个机制实现 使用GE添加GA 的功能.
+
+---
+
+```cpp
+void UAbilitySystemComponent::OnGiveAbility(FGameplayAbilitySpec& Spec)
+{
+    UGameplayAbility* PrimaryInstance = Spec.GetPrimaryInstance();
+	if (PrimaryInstance)
+	{
+		PrimaryInstance->OnGiveAbility(AbilityActorInfo.Get(), Spec);
+	}
+	else
+	{
+		Spec.Ability->OnGiveAbility(AbilityActorInfo.Get(), Spec);
+	}
+}
+```
+
+注意 这里需要区分 实例化 和 CDO 的GA.
+
+非实例化的GA 不能获得以下信息:
+```cpp
+UGameplayAbility::GetWorld()
+UGameplayAbility::GetAbilityLevel()
+UGameplayAbility::SetCurrentActorInfo()
+UGameplayAbility::SetCurrentActivationInfo()
+UGameplayAbility::GetCooldownTimeRemaining()
+
+UGameplayAbility::GetOwningActorFromActorInfo()
+UGameplayAbility::GetCurrentActorInfo()
+UGameplayAbility::GetCurrentActivationInfo()
+UGameplayAbility::GetCurrentAbilitySpecHandle()
+UGameplayAbility::SetCurrentMontage()
+UGameplayAbility::GetCurrentAbilitySpec()
+UGameplayAbility::GetGrantedByEffectContext()
+UGameplayAbility::RemoveGrantedByEffect()
+```
+原因也比较简单，因为它没有 `CurrentActorInfo` ，而这些功能里面大部分都需要 `CurrentActorInfo`.
+
+
+---
+
+
+##### 触发技能
+
+
+```cpp
+bool UAbilitySystemComponent::TryActivateAbility(FGameplayAbilitySpecHandle AbilityToActivate, bool bAllowRemoteActivation)
+{
+    const ENetRole NetMode = ActorInfo->AvatarActor->GetLocalRole();
+	// This should only come from button presses/local instigation (AI, etc).
+	if (NetMode == ROLE_SimulatedProxy)
+	{
+		return false;
+	}
+}
+```
+
+上面这一段保证 玩家不能触发其他玩家的技能.<br>
+只应该由本地玩家的输入（如按键）或本地 AI 的决策（如行为树触发）来触发技能.
+
+---
+
+```cpp
+bool UAbilitySystemComponent::TryActivateAbility(FGameplayAbilitySpecHandle AbilityToActivate, 
+bool bAllowRemoteActivation)
+{
+    const ENetRole NetMode = ActorInfo->AvatarActor->GetLocalRole();
+    bool bIsLocal = AbilityActorInfo->IsLocallyControlled();
+
+    if (!bIsLocal 
+    && (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalOnly 
+    || Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalPredicted))
+    {
+        ClientTryActivateAbility
+    }
+
+    if (NetMode != ROLE_Authority 
+    && (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::ServerOnly 
+    || Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::ServerInitiated))
+	{
+        CallServerTryActivateAbility
+	}
+}
+
+
+UFUNCTION(Client, reliable)
+void ClientTryActivateAbility(FGameplayAbilitySpecHandle AbilityToActivate);
+```
+
+这一段要处理 身份不匹配 的问题，例如 技能是 `LocalOnly`，但是此时是在服务器上，就要手动去调用客户端的技能触发函数.
+
+`bIsLocal` 如果是true，说明这个角色是本地控制的，例如 玩家A在自己的客户端上 或者 服务器玩家在服务器上.
+
+第一个if: `!bIsLocal` 不是本地控制，但是技能要求 `LocalOnly`，这就产生了冲突，说明当前主机是服务器，只能让客户端去触发技能.
+
+
+第二个if: 不是权威角色，但是要求在 Server 上执行，只能调用服务器的函数去触发技能.
+
+
+如果这两个if都是false，说明角色的权限和客户端是匹配的，可以正常执行 而不需要RPC.
+
+接下来就到了 `InternalTryActivateAbility` .
+
+```cpp
+bool UAbilitySystemComponent::InternalTryActivateAbility(/*...*/)
+{
+    else if (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalPredicted)
+    {
+        CallServerTryActivateAbility(Handle, Spec->InputPressed, ScopedPredictionKey);
+    }
+}
+```
+GA的默认策略是 `LocalPredicted`， 所以到了这里会让服务器也触发技能，也涉及到预测.
+
+---
+
+
+##### 技能预测
+```
+/**
+ *	
+ *	游戏能力预测概述
+ *	
+ *	高层目标：
+ *	在 GameplayAbility 层面（实现一个能力时），预测应当是透明的.一个能力只需说“做 X->Y->Z”，我们就会自动预测其中可以预测的部分.
+ *	我们希望避免在能力本身中出现诸如“如果是权威端：做 X.否则：做 X 的预测版本”这样的逻辑.
+ *	
+ *	目前并非所有情况都已解决，但我们拥有一个非常坚实的客户端预测框架.
+ *	
+ *	当我们说“客户端预测”时，我们实际上是指客户端预测游戏模拟状态.有些东西完全可以完全在客户端侧处理，而不必在预测系统内工作.
+ *	例如，脚步声完全在客户端侧，从不与此系统交互.但客户端预测其法力值在施法时从 100 降到 90，这属于“客户端预测”.
+ *		
+ *	我们目前预测什么？
+ *	- 能力激活
+ *	- 触发事件
+ *	- GameplayEffect 应用：
+ *		- 属性修改（例外：Execution 当前不预测，只预测属性修饰符）
+ *		- GameplayTag 修改
+ *	- GameplayCue 事件（包括来自预测性 GameplayEffect 内部以及独立触发的）
+ *		
+ *	- 动画蒙太奇
+ *	- 移动（内置于 UE 的 UCharacterMovement）
+ *	
+ *	
+ *	一些我们不预测的内容（其中大部分我们可能可以预测，但目前没有）：
+ *	- GameplayEffect 移除
+ *	- GameplayEffect 周期性效果（持续伤害 ticking）
+ *	
+ *	
+ *	我们尝试解决的问题：
+ *	1. “我能这样做吗？” 预测的基本协议.
+ *	2. “撤销” 当预测失败时如何撤销副作用.
+ *	3. “重做” 如何避免重放我们在本地预测但之后又从服务器复现的副作用.
+ *	4. “完整性” 如何确保我们真正预测了所有副作用.
+ *	5. “依赖关系” 如何管理依赖预测以及预测事件的链条.
+ *	6. “覆盖” 如何以预测方式覆盖本来由服务器复制/拥有的状态.
+ *	
+ *	---------------------------------------------------------
+ *	
+ *	实现细节
+ *	
+ *	*** PredictionKey ***
+ *	
+ *	这个系统中的一个基本概念是 Prediction Key（FPredictionKey）.一个 Prediction Key 本身就是在客户端中心生成的一个唯一 ID.
+ *  客户端会将其预测键发送给服务器，并将预测性动作和副作用与此键关联.服务器可以接受或拒绝该预测键，并且也会将服务器端创建的副作用与此预测键关联.
+ *	
+ *	（重要）FPredictionKey 总是从客户端复制到服务器，但当从服务器复制回客户端时，它们 *只* 会复制给最初将该预测键发送给服务器的那个客户端.
+ *	这发生在 FPredictionKey::NetSerialize 中.当从客户端发送的预测键通过复制属性被复制回来时，其他所有客户端将收到一个无效（0）的预测键.
+ *	
+ *	
+ *	*** 能力激活 ***
+ *	
+ *	能力激活是一等预测性动作.每当客户端预测性地激活一个能力时，它会显式地向服务器请求，而服务器会显式地响应.一旦一个能力被预测性激活，
+ *	客户端就拥有了一个有效的“预测窗口”，在此期间发生的预测性副作用不会被显式地“询问”.
+ * （例如，我们不会显式地问“我能减少法力值吗，我能将这个能力设为冷却吗”，这些动作在逻辑上与激活能力是原子性的）.
+ *	
+ *	
+ *	AbilitySystemComponent 提供了一组函数用于在客户端和服务器之间通信能力激活：TryActivateAbility -> ServerTryActivateAbility -> ClientActivateAbility(Failed/Succeed).
+ *	
+ *	1. 客户端调用 TryActivateAbility，这会生成一个新的 FPredictionKey 并调用 ServerTryActivateAbility.
+ *	2. 客户端在收到服务器回复之前继续执行，并使用生成的 PredictionKey 调用 ActivateAbility，该键与 Ability 的 ActivationInfo 关联.
+ *	3. 在 ActivateAbility 调用完成 *之前* 发生的任何副作用都会与生成的 FPredictionKey 关联.
+ *	4. 服务器在 ServerTryActivateAbility 中决定能力是否真的发生，调用 ClientActivateAbility(Failed/Succeed) 并将 UAbilitySystemComponent::ReplicatedPredictionKey 设置为发送过来的生成的键.
+ *	5. 如果客户端收到 ClientAbilityFailed，它会立即终止该能力并回滚与该预测键关联的副作用.
+ *		5a. “回滚” 通过 FPredictionKeyDelegates 和 FPredictionKey::NewRejectedDelegate/NewCaughtUpDelegate/NewRejectOrCaughtUpDelegate 实现.
+ *
+ *		在 TryActivateAbility 中注册回调：
+ *		
+ *		// 如果这个 PredictionKey 被拒绝，我们将调用 OnClientActivateAbilityFailed.
+ *		ThisPredictionKey.NewRejectedDelegate().BindUObject(this, &UAbilitySystemComponent::OnClientActivateAbilityFailed, Handle, ThisPredictionKey.Current);
+ *		
+ *		
+ *		在 ClientActivateAbilityFailed_Implementation 中调用回调：
+ *		FPredictionKeyDelegates::BroadcastRejectedDelegate(PredictionKey);
+ *		
+ *	6. 如果接受，客户端必须等待属性复制跟上（Succeed RPC 会立即发送，属性复制会自行发生）.一旦 ReplicatedPredictionKey 达到之前步骤中使用的键，
+ *		客户端就可以撤销其预测性副作用.参见 UAbilitySystemComponent::OnRep_PredictionKey.				
+ *			 
+ ```
+
+---
+
+预测键（PredictionKey）的作用:<br>
+
+激活键：能力激活时生成的键（GetActivationPredictionKey()），用于关联能力激活本身及其基础副作用.
+
+作用域键：通过 FScopedPredictionWindow 生成的键，用于关联能力内部一个逻辑块（如一次射击）产生的所有副作用（弹药消耗、散射增加、命中标记等）.
+
+依赖关系：如果能力激活被服务器拒绝，整个作用域内的所有副作用都会自动回滚；<br>
+如果接受，则等待服务器复制状态后，客户端的预测效果会被服务器生成的正式效果取代（或确认）.
+
+---
+简单来说 预测的设计思路是这样的 : <br>
+在客户端触发技能时，计算一个预测Key 发给服务器，<br>
+客户端继续执行接下来的任务，先让客户端的玩家爽到，<br>
+同时 服务器也去触发技能、造成伤害，<br>
+
+如果服务器那边触发技能失败了，服务器就会把预测Key返回给客户端，告诉客户端 这个技能的触发被拒绝了 需要撤回在客户端上执行的效果，<br>
+比如说 客户端的技能已经应用了一个GE，那么此时就会把GE撤销，以及取消GA，
+
+
+```cpp
+bool UAbilitySystemComponent::InternalTryActivateAbility(/*...*/)
+{
+    if (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalOnly || (NetMode == ROLE_Authority))
+    { }
+    else if (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalPredicted)
+    {
+        FScopedPredictionWindow ScopedPredictionWindow(this, true);
+        CallServerTryActivateAbility(Handle, Spec->InputPressed, ScopedPredictionKey);
+        Ability->CallActivateAbility(Handle, ActorInfo, ActivationInfo, OnGameplayAbilityEndedDelegate, TriggerEventData);
+    }
+}
+```
+
+在客户端上触发技能时，if执行的是 false 分支，到了服务器那边 执行的就是 true 分支.
+
+先解释客户端的分支，<br>
+不等服务器的确认消息，继续往下执行，当服务器告诉客户端不能执行时，再来取消GA 撤回GE. <br>
+
+`FScopedPredictionWindow` 的伟大作用是实现链式触发技能的预测，在这个结构体的构造函数中 计算一个新的预测Key，同时也会保存并绑定上一个预测Key，<br>
+当这个false分支执行完后，触发结构体的析构，把上一个预测Key给还原回去，
+
+`UAbilitySystemComponent` 作为统领全局的组件，预测Key由它来保存，其他的部件 (GA、GE等) 就可以通过ASC来绑定预测委托了，<br>
+
+例如 客户端执行的技能链是 X技能-->Y技能--->Z技能， 当X技能触发Y技能时，函数堆栈大概是这样的 :<br>
+自下往上 :
+```cpp
+/* Y技能 */
+UAbilitySystemComponent::InternalTryActivateAbility
+
+/*....*/
+
+/* X技能 */
+UAbilitySystemComponent::InternalTryActivateAbility
+```
+
+当执行到Y技能时，堆栈里依然存有X技能的触发函数，`FScopedPredictionWindow` 在计算新的预测Key时，也会绑定上一个预测Key的拒绝委托，<br>
+当X技能被服务器拒绝时，Y技能就可以跟着被取消，<br>
+
+Y技能在应用GE时，GE也可以绑定ASC组件的预测Key，当预测Key的拒绝委托被触发时，所有绑定了这个委托的函数都会被执行，<br>
+
+GE的预测绑定 : 
+
+```cpp
+FActiveGameplayEffect* FActiveGameplayEffectsContainer::ApplyGameplayEffectSpec(/*..*/)
+{
+    // Once replicated state has caught up to this prediction key, we must remove this gameplay effect.
+	InPredictionKey.NewRejectOrCaughtUpDelegate(FPredictionKeyEvent::CreateUObject(Owner, &UAbilitySystemComponent::RemoveActiveGameplayEffect_NoReturn, AppliedActiveGE->Handle, -1));
+}
+
+/** This only exists so it can be hooked up to a multicast delegate */
+void RemoveActiveGameplayEffect_NoReturn(FActiveGameplayEffectHandle Handle, int32 StacksToRemove=-1)
+{
+	RemoveActiveGameplayEffect(Handle, StacksToRemove);
+}
+```
+
+在GA内部触发的GE 可以绑定预测，而直接调用ASC的`ApplyGameplayEffect`等函数 就不会预测了，<br> 
+一般来说 若要直接调用`ApplyGameplayEffect`的话，应该在服务器上执行，而非在客户端上调用` ApplyGameplayEffect`<br>
+
+---
+
+服务器视角 ， 此时 NetMode 是 `ROLE_Authority` ，所以执行 true 分支.
+
+```cpp
+void UAbilitySystemComponent::InternalServerTryActivateAbility(FGameplayAbilitySpecHandle Handle, bool InputPressed, 
+const FPredictionKey& PredictionKey, const FGameplayEventData* TriggerEventData)
+{
+    if (InternalTryActivateAbility(Handle, PredictionKey, &InstancedAbility, nullptr, TriggerEventData))
+    {
+
+    }
+    else
+    {
+        ClientActivateAbilityFailed(Handle, PredictionKey.Current);
+    }
+}
+
+bool UAbilitySystemComponent::InternalTryActivateAbility(/*...*/)
+{
+    if (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalOnly || (NetMode == ROLE_Authority))
+    {
+        ActivationInfo.ServerSetActivationPredictionKey(InPredictionKey);
+
+        // we may have changed the prediction key so we need to update the scoped key to match
+		FScopedPredictionWindow ScopedPredictionWindow(this, ActivationInfo.GetActivationPredictionKey());
+
+        // Tell the client that you activated it (if we're not local and not server only)
+        ClientActivateAbilitySucceed(Handle, ActivationInfo.GetActivationPredictionKey());
+    }
+    else if (Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalPredicted)
+    { }
+}
+```
+
+如果不能执行，调用 `ClientActivateAbilityFailed` 告诉客户端预测失败.<br>
+在这个函数中，广播绑定了这个预测Key的委托函数，告诉它们预测失败了，<br>
+之后 根据 `Handle`找到对应的GA，取消GA的执行.
 
 ---
 
@@ -4593,12 +5371,16 @@ FGameplayAbilitySpecContainer ActivatableAbilities;
 ---
 
 ##### GameplayEffectContext
+
+这个Context可以扩展，参考 `TargetData` 这一节.
+
 `Instigator` 是一个非常关键和常见的概念.
 它的核心含义是 “引发事件的责任方” 或 “行为的发起者”.
 
 当某个实体（通常是`Actor`，尤其是`Pawn`或`Character`）执行了一个动作，而这个动作产生了后续影响（如造成伤害、生成特效、触发事件）时，这个实体就被设置为该影响的 `Instigator.`
 
-例如:<br>在运输船上，玩家A投掷的手雷炸死了玩家B.<br>手雷的伤害效果会将玩家A的`Pawn`设置为`Instigator`.<br>这样，游戏系统就知道这个击杀应该算在玩家A头上（增加得分、播放击杀提示等）. <br>玩家B复活后 击杀玩家A，可以让击杀图标带有`复仇`标记.
+例如:<br>在运输船上，玩家A投掷的手雷炸死了玩家B.<br>手雷的伤害效果会将玩家A的`Pawn`设置为`Instigator`.<br>
+这样，游戏系统就知道这个击杀应该算在玩家A头上（增加得分、播放击杀提示等）.
 
 ```cpp
 FGameplayEffectContextHandle UAbilitySystemComponent::MakeEffectContext() const
@@ -5387,6 +6169,9 @@ bool UGameplayAbility::DoesAbilitySatisfyTagRequirements(/**/)
 
 这些标签与`ActivationRequiredTags`的用途相似，也是在`DoesAbilitySatisfyTagRequirements`中使用.
 
+但是这些标签要求拥有 `TriggerEventData` : 只有 `SendGamePlayEvent` 才会在激活技能时，附带`TriggerEventData`,<br>
+由此可知，这几个Tag是在`SendGamePlayEvent`下使用的.<br> 
+要求 Source 或者 Target 拥有/没有 某些标签，才能激活技能.
 
 `UAbilitySystemComponent::InternalTryActivateAbility` 传来要对比的数据，
 ```cpp
@@ -5404,31 +6189,34 @@ DoesAbilitySatisfyTagRequirements(*AbilitySystemComponent, SourceTags, TargetTag
 在`SendGamePlayEvent`函数中，参数`Payload`的结构体就是 `FGameplayEventData` 类型.
 
 ```cpp
-/* Source Tag */
-if (SourceTags->HasAny(SourceBlockedTags))
+bool UGameplayAbility::DoesAbilitySatisfyTagRequirements(const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags,/*..*/) const
 {
-    bBlocked = true;
-}
+    /* Source Tag */
+    if (SourceTags->HasAny(SourceBlockedTags))
+    {
+        bBlocked = true;
+    }
 
-if (!SourceTags->HasAll(SourceRequiredTags))
-{
-    bMissing = true;
-}
+    if (!SourceTags->HasAll(SourceRequiredTags))
+    {
+        bMissing = true;
+    }
 
-/* Target Tag */
-if (TargetTags->HasAny(TargetBlockedTags))
-{
-    bBlocked = true;
-}
+    /* Target Tag */
+    if (TargetTags->HasAny(TargetBlockedTags))
+    {
+        bBlocked = true;
+    }
 
-if (!TargetTags->HasAll(TargetRequiredTags))
-{
-    bMissing = true;
-}
+    if (!TargetTags->HasAll(TargetRequiredTags))
+    {
+        bMissing = true;
+    }
 
-/* --- */
-if (bBlocked) { return false; }
-if (bMissing) {	return false; }
+    /* --- */
+    if (bBlocked) { return false; }
+    if (bMissing) {	return false; }
+}
 ```
 
 ---
@@ -6154,7 +6942,7 @@ class UAbilitySystemComponent : /*...*/
 
 ---
 
-##### 技能冷却的实现
+##### 技能冷却的实现机制
 
 除此之外，`TargetTagsGameplayEffectComponent` 还有一个用途: 技能冷却.<br>
 ```cpp
@@ -6519,7 +7307,6 @@ GE应用时 一路过来 `EventType`都是 `OnActive` 或者 `WhileActive`,<br>
 #### GameplayCue 2
 
 这部分是未来的我写的内容，主打一个简洁.<br>
-前面写的那一节 我自己都不想看.
 
 ![alt text](Lyra1/img4/GC2.png)
 
@@ -6662,14 +7449,14 @@ AGameplayCueNotify_BurstLatent::OnExecute_Implementation()
 
 ##### WaitDelay
 
-虽然是Delay，但是非常重要，它支持技能的预测.
+虽然是Delay，但是非常重要.
 
-服务器拒绝执行技能，但是客户端已经先行一步 执行到了 `Delay`，
+Delay 本质上是通过 `SetTimer` 定时器来实现.
 
-如果用普通Delay的话，客户端因为预测失败 取消技能时，`Delay`不会被取消.<br>
+如果用普通Delay的话，客户端在结束技能时，`Delay`不会被取消，导致继续执行后面的逻辑 造成逻辑混乱的问题.<br>
 使用AbilityTask版本的`Delay`就可以避免这个问题.
 
-GA在结束时，结束GA所创建的Task : 
+GA在结束时 会结束GA所创建的Task:
 
 ```cpp
 void UGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, /*...*/)
@@ -6688,10 +7475,120 @@ void UGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, /*...
 }
 ```
 
+`Activate` 入口:
+
+```cpp
+void UAbilityTask_WaitDelay::Activate()
+{
+	UWorld* World = GetWorld();
+	TimeStarted = World->GetTimeSeconds();
+
+	// Use a dummy timer handle as we don't need to store it for later but we don't need to look for something to clear
+	FTimerHandle TimerHandle;
+	World->GetTimerManager().SetTimer(TimerHandle, this, &UAbilityTask_WaitDelay::OnTimeFinish, Time, false);
+}
+```
+
+TaskDelay没有绑定在Task取消时 取消TimerManager的事件.<br>
+1.如果 技能被取消了，但是Time时间还没有结束，当Time时间结束时 执行`OnTimeFinish`函数，此时是否安全？<br>
+
+
+```cpp
+void UAbilityTask_WaitDelay::OnTimeFinish()
+{
+	if (ShouldBroadcastAbilityTaskDelegates())
+	{
+		OnFinish.Broadcast();
+	}
+	EndTask();
+}
+```
+`ShouldBroadcastAbilityTaskDelegates` 会判断Ability的有效性 以及 激活状态，符合这两个条件时 才会执行 `OnFinish` 委托.
+
+2.如果 `UAbilityTask_WaitDelay` 被GC回收了，`OnTimeFinish` 如何执行？<br>
+
+`FTimerManager` 的行为 :
+```cpp
+void FTimerManager::Tick(float DeltaTime)
+{
+    while (ActiveTimerHeap.Num() > 0)
+    {
+        Top->TimerDelegate.Execute();
+    }
+}
+
+void FTimerUnifiedDelegate::Execute()
+{
+	if (FuncDelegate.IsBound())
+	{
+		FScopeCycleCounterUObject Context(FuncDelegate.GetUObject());
+		FuncDelegate.Execute();
+	}
+}
+```
+`FTimerManager` 在执行到期事件时，判断 `IsBound` 的情况，<br>
+在`UAbilityTask_WaitDelay::Activate`中 ，绑定事件时 传入了 `this`，`TBaseUObjectMethodDelegateInstance`最终使用 弱指针保存`this`.<br>
+
+构造函数 : 由 `TWeakObjectPtr` 保存了 `InUserObject`.
+```cpp
+template <typename... InVarTypes>
+explicit TBaseUObjectMethodDelegateInstance(UserClass* InUserObject, FMethodPtr InMethodPtr, InVarTypes&&... Vars)
+		: Super     (Forward<InVarTypes>(Vars)...)
+		, UserObject(InUserObject)
+		, MethodPtr (InMethodPtr)
+{
+		// NOTE: UObject delegates are allowed to have a null incoming object pointer.  UObject weak pointers can expire,
+		//       an it is possible for a copy of a delegate instance to end up with a null pointer.
+		checkSlow(MethodPtr != nullptr);
+}
+
+// Pointer to the user's class which contains a method we would like to call.
+TWeakObjectPtr<UserClass> UserObject;
+
+// C++ member function pointer.
+FMethodPtr MethodPtr;
+```
+
+在判断 `IsBound` 时，附带了 `UserObjectPtr` 有效的条件.
+```cpp
+bool IsBound() const
+{
+	FReadAccessScope ReadScope = GetReadAccessScope();
+
+	const IDelegateInstance* DelegateInstance = GetDelegateInstanceProtected();
+	return DelegateInstance && DelegateInstance->IsSafeToExecute();
+}
+
+bool TBaseUFunctionDelegateInstance::IsSafeToExecute() const final
+{
+	return UserObjectPtr.IsValid();
+}
+```
+
+即使`UAbilityTask_WaitDelay`被GC了，`FTimerManager`在执行时 也会判断 `UObject` 的有效性，<br>
+如果 `UObject` 有效 才会调用绑定的函数，所以是安全的.
+
 ---
 ##### WaitTargetData
 
-这个Task与网络有关，网络部分在 `Meta.md` 的网络章节介绍，这里只介绍单机模式.<br>
+
+这个Task与网络有关，网络部分在后文介绍，这里只介绍单机模式.<br>
+
+```
+有这样一个技能，
+1.玩家通过鼠标左键确定要施法，鼠标右键取消施法，如何实现？ 
+2.如何确定玩家所瞄准的位置？
+
+3.玩家的技能需要一些只有客户端才知道的数据，例如 鼠标点击的位置，
+但是 技能是在服务器上执行的，鼠标也只在客户端上有，服务器怎么知道玩家点的是哪里？
+这就需要客户端告诉服务器点了哪里.
+```
+关于第3个问题 在 `Meta.md` 的GAS网络部分解释.
+
+这个Task用于处理玩家交互与目标确认的核心异步任务,它负责在GA执行期间生成一个 `TargetActor`，监听玩家的选择（如准星指向、范围覆盖），<br>
+并将最终的位置、对象引用或射线碰撞数据 `FGameplayAbilityTargetData` 传回给 `Ability`.
+
+
 
 **设计思路**
 
@@ -6911,7 +7808,7 @@ FSimpleMulticastDelegate& UAbilitySystemComponent::AbilityReplicatedEventDelegat
 InvokeReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed, AbilitySpec->Handle, AbilitySpec->ActivationInfo.GetActivationPredictionKey());
 ```
 
-在Lyra中，通过重写 `AbilitySpecInputPressed` 增加了 `InvokeReplicatedEvent` 的调用.
+在Lyra中，通过重写 `AbilitySpecInputPressed` 函数，增加 `InvokeReplicatedEvent` 的调用.
 
 ```cpp
 void ULyraAbilitySystemComponent::AbilitySpecInputPressed(FGameplayAbilitySpec& Spec)
@@ -6948,15 +7845,18 @@ void ULyraAbilitySystemComponent::ProcessAbilityInput(float DeltaTime, bool bGam
 Lyra使用GameplayTag映射按键和技能，所以 `bReplicateInputDirectly` 以及所涉及的旧版输入绑定是不能用的.
 
 只调用 `InvokeReplicatedEvent` 是不够的， 因为这只是在本地客户端上的函数，远处的服务器是不知道的.<br>
-但是 `UAbilityTask_WaitInputPress` 支持服务器通信，它解决了这个问题 向服务器发送按键信息. <br>
-Task调用这个 RPC 函数 通知服务器:
+或者说 在单机模式下 只调用 `InvokeReplicatedEvent` 就行了. 
+
+网络模式下 使用 `UAbilityTask_WaitInputPress`.<br>
+`WaitInputPress` 支持服务器通信，它会向服务器发送按键信息. <br>
+调用这个 RPC 函数 通知服务器:
 ```cpp
 UFUNCTION(Server, reliable, WithValidation)
 void ServerSetReplicatedEvent(/*...*/)
 ```
 
 所以 整个流程是这样的: 客户端玩家按下按键，调用 `InvokeReplicatedEvent` 参数是InputPressed ，<br>
-Task监听了InputPressed的Event，当Task收到这个消息时，向服务器发送消息， 让服务器知道玩家按下了按键.
+而这个Task监听了InputPressed的Event，当Task收到这个消息时，向服务器发送消息， 让服务器知道玩家按下了按键.
 
 ---
 
@@ -8360,6 +9260,128 @@ TArray<FActiveGameplayEffectHandle> FGameplayAbilityTargetData::ApplyGameplayEff
 ```
 
 遍历`Actors`，`ApplyGameplayEffectSpecToTarget`: 对`Actor`应用GE. <br>
+
+---
+
+
+##### 网络复制
+
+有这样一个技能，玩家通过鼠标左键确定要施法，鼠标右键取消施法，<br>
+或者是 玩家的技能需要一些只有客户端才知道的数据，例如 鼠标点击的位置，<br>
+但是 技能是在服务器上执行的，鼠标也只在客户端上有，服务器怎么知道玩家点的是哪里？<br>
+这就需要客户端告诉服务器点了哪里.
+
+
+```cpp
+/**
+ * 等待目标选取（Targeting）Actor（从参数生成）提供数据.可以设置成在输出数据后不结束任务.可以通过任务名称来结束它.
+ *
+ * 警告：这些 Actor 每次技能激活时都会生成一次，并且在默认形态下效率不高.
+ * 对于大多数游戏，你需要派生它并大幅修改这个 Actor，或者你需要在一个特定于游戏的 Actor 或蓝图中实现类似的功能，以避免生成 Actor 的开销.
+ * 这个任务没有被内部游戏充分测试，但它是学习目标复制如何发生的一个有用的类.
+ */
+UCLASS()
+class UAbilityTask_WaitTargetData: public UAbilityTask
+```
+
+先解决数据问题，服务器如何知道客户端才有的数据？ <br>
+关键代码 :
+```cpp
+void UAbilityTask_WaitTargetData::OnTargetDataReadyCallback(const FGameplayAbilityTargetDataHandle& Data)
+{
+	if (!TargetActor->ShouldProduceTargetDataOnServer)
+	{
+		FGameplayTag ApplicationTag; // Fixme: where would this be useful?
+		ASC->CallServerSetReplicatedTargetData(GetAbilitySpecHandle(), GetActivationPredictionKey(), Data, ApplicationTag, ASC->ScopedPredictionKey);
+	}
+}
+
+void UAbilityTask_WaitTargetData::RegisterTargetDataCallbacks()
+{
+	if (!bIsLocallyControlled)
+	{
+		FGameplayAbilitySpecHandle	SpecHandle = GetAbilitySpecHandle();
+		FPredictionKey ActivationPredictionKey = GetActivationPredictionKey();
+
+		//Since multifire is supported, we still need to hook up the callbacks
+		ASC->AbilityTargetDataSetDelegate(SpecHandle, ActivationPredictionKey ).AddUObject(this, &UAbilityTask_WaitTargetData::OnTargetDataReplicatedCallback);
+		ASC->AbilityTargetDataCancelledDelegate(SpecHandle, ActivationPredictionKey ).AddUObject(this, &UAbilityTask_WaitTargetData::OnTargetDataReplicatedCancelledCallback);
+
+		ASC->CallReplicatedTargetDataDelegatesIfSet(SpecHandle, ActivationPredictionKey );
+	}
+}
+
+/*--------------------*/
+
+UFUNCTION()
+virtual void OnTargetDataReplicatedCallback(const FGameplayAbilityTargetDataHandle& Data, FGameplayTag ActivationTag);
+
+UFUNCTION()
+virtual void OnTargetDataReplicatedCancelledCallback();
+```
+基本模型就是这样的，绑定ASC的委托， 通过ASC传输数据.
+
+```cpp
+ASC->AbilityTargetDataSetDelegate()
+ASC->AbilityTargetDataCancelledDelegate()
+ASC->CallReplicatedTargetDataDelegatesIfSet()
+
+FAbilityTargetDataSetDelegate& UAbilitySystemComponent::AbilityTargetDataSetDelegate(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey)
+{
+	return AbilityTargetDataMap.FindOrAdd(FGameplayAbilitySpecHandleAndPredictionKey(AbilityHandle, AbilityOriginalPredictionKey))->TargetSetDelegate;
+}
+```
+
+绑定TargetData的确认和取消，最后一个 `CallIfSet` 是为了解决网络延迟问题，<br>
+如果任务在 `Activate()` 中绑定委托时，数据已经存在于 `AbilityTargetDataMap` 中，那么这些数据将永远不会触发委托，导致技能逻辑无法正常接收目标数据.
+
+服务器绑定的委托是 `TargetSetDelegate`， 之后，就只能等客户端发来数据了.
+
+客户端发送数据到服务器 : 
+```cpp
+ASC->CallServerSetReplicatedTargetData()
+```
+发送过程 : 调用服务器函数，最后广播 `TargetSetDelegate` 委托.
+```cpp
+void UAbilitySystemComponent::ServerSetReplicatedTargetData_Implementation(const FGameplayAbilityTargetDataHandle& ReplicatedTargetDataHandle /*...*/)
+{
+	FScopedPredictionWindow ScopedPrediction(this, CurrentPredictionKey);
+
+	TSharedRef<FAbilityReplicatedDataCache> ReplicatedData = AbilityTargetDataMap.FindOrAdd(FGameplayAbilitySpecHandleAndPredictionKey(AbilityHandle, AbilityOriginalPredictionKey));
+	/*...*/
+	ReplicatedData->TargetData = ReplicatedTargetDataHandle;
+	ReplicatedData->TargetSetDelegate.Broadcast(ReplicatedTargetDataHandle, ReplicatedData->ApplicationTag);
+}
+```
+
+此时，服务器上绑定的委托就要执行了，
+
+```cpp
+ASC->AbilityTargetDataSetDelegate(SpecHandle, ActivationPredictionKey ).AddUObject(this, &UAbilityTask_WaitTargetData::OnTargetDataReplicatedCallback);
+
+/** Valid TargetData was replicated to use (we are server, was sent from client) */
+void UAbilityTask_WaitTargetData::OnTargetDataReplicatedCallback(const FGameplayAbilityTargetDataHandle& Data, FGameplayTag ActivationTag)
+{
+	ASC->ConsumeClientReplicatedTargetData(GetAbilitySpecHandle(), GetActivationPredictionKey());
+	ValidData.Broadcast(MutableData);
+	EndTask();
+}
+```
+
+服务器通过 `ValidData` 把数据传到蓝图里面，GA蓝图就可以往下继续执行了.
+
+```cpp
+void UAbilitySystemComponent::ConsumeClientReplicatedTargetData(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey)
+{
+	TSharedPtr<FAbilityReplicatedDataCache> CachedData = AbilityTargetDataMap.Find(FGameplayAbilitySpecHandleAndPredictionKey(AbilityHandle, AbilityOriginalPredictionKey));
+	if (CachedData.IsValid())
+	{
+		CachedData->TargetData.Clear();
+		CachedData->bTargetConfirmed = false;
+		CachedData->bTargetCancelled = false;
+	}
+}
+```
 
 
 ---
@@ -9980,6 +11002,7 @@ void UGameplayAbility::ApplyCost()
 }
 ```
 
+
 ---
 
 #### 切换武器
@@ -10462,7 +11485,7 @@ Anim Layer Applied (应用的动画层)
 ---
 
 
-#### 开枪技能
+#### 射线检测
 `ULyraWeaponInstance`
 - 管理动画层选择（基于装备状态和标签）
 - 处理输入设备属性（如手柄震动）
@@ -10741,8 +11764,156 @@ void ULyraGameplayAbility_RangedWeapon::OnTargetDataReadyCallback(const FGamepla
 
 ![alt text](Lyra1/img4/image-11.png)
 
+---
+
+#### 网络数据
 
 
+![alt text](Lyra1/img4/image-10.png)
+
+这里的射线检测是在客户端上执行的，要对射线检测到的敌人造成伤害 还是要通过服务器来执行.<br>
+问题 射线检测的结果是在客户端上的，服务器怎么知道击中了谁？
+
+
+
+```cpp
+void ULyraGameplayAbility_RangedWeapon::ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, 
+const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+{
+    OnTargetDataReadyCallbackDelegateHandle = MyAbilityComponent->AbilityTargetDataSetDelegate(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey()).AddUObject(this, &ThisClass::OnTargetDataReadyCallback);
+}
+
+FAbilityTargetDataSetDelegate& UAbilitySystemComponent::AbilityTargetDataSetDelegate(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey)
+{
+	return AbilityTargetDataMap.FindOrAdd(FGameplayAbilitySpecHandleAndPredictionKey(AbilityHandle, AbilityOriginalPredictionKey))->TargetSetDelegate;
+}
+```
+技能激活时，服务器和客户端 都会绑定 `AbilityTargetDataMap` 的委托，
+
+客户端执行 `StartRangedWeaponTargeting` , 简化后的核心代码 :
+```cpp
+void ULyraGameplayAbility_RangedWeapon::StartRangedWeaponTargeting()
+{
+    TArray<FHitResult> FoundHits;
+	PerformLocalTargeting(/*out*/ FoundHits);
+
+    FGameplayAbilityTargetDataHandle TargetData;
+
+    for (const FHitResult& FoundHit : FoundHits)
+	{
+		FLyraGameplayAbilityTargetData_SingleTargetHit* NewTargetData = new FLyraGameplayAbilityTargetData_SingleTargetHit();
+		NewTargetData->HitResult = FoundHit;
+		NewTargetData->CartridgeID = CartridgeID;
+
+		TargetData.Add(NewTargetData);
+	}
+    // Process the target data immediately
+	OnTargetDataReadyCallback(TargetData, FGameplayTag());
+}
+```
+
+把射线检测的结果放在 `TargetData` 里面，调用 `OnTargetDataReadyCallback`，<br>
+此时 `StartRangedWeaponTargeting` 和 `OnTargetDataReadyCallback` 都发生在客户端上.
+
+`OnTargetDataReadyCallback` 拿着 `TargetData` 做了什么 ？
+```cpp
+void ULyraGameplayAbility_RangedWeapon::OnTargetDataReadyCallback(const FGameplayAbilityTargetDataHandle& InData, FGameplayTag ApplicationTag)
+{
+    FScopedPredictionWindow	ScopedPrediction(MyAbilityComponent);
+
+	// Take ownership of the target data to make sure no callbacks into game code invalidate it out from under us
+	FGameplayAbilityTargetDataHandle LocalTargetDataHandle(MoveTemp(const_cast<FGameplayAbilityTargetDataHandle&>(InData)));
+
+    const bool bShouldNotifyServer = CurrentActorInfo->IsLocallyControlled() && !CurrentActorInfo->IsNetAuthority();
+	if (bShouldNotifyServer)
+	{
+		MyAbilityComponent->CallServerSetReplicatedTargetData(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey(), LocalTargetDataHandle, ApplicationTag, MyAbilityComponent->ScopedPredictionKey);
+	}
+}
+```
+`CallServerSetReplicatedTargetData` 拿着 `TargetDataHandle` 和 预测Key ，调用了服务器的 `ServerSetReplicatedTargetData` 函数:
+```cpp
+void UAbilitySystemComponent::CallServerSetReplicatedTargetData(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey, 
+const FGameplayAbilityTargetDataHandle& ReplicatedTargetDataHandle, FGameplayTag ApplicationTag, FPredictionKey CurrentPredictionKey)
+{
+    ServerSetReplicatedTargetData(AbilityHandle, AbilityOriginalPredictionKey, ReplicatedTargetDataHandle, ApplicationTag, CurrentPredictionKey);
+}
+
+UFUNCTION(Server, reliable, WithValidation)
+void ServerSetReplicatedTargetData(/*...*/);
+```
+
+---
+
+服务器视角 : 
+
+`ServerSetReplicatedTargetData` 拿着客户端发来的 `TargetDataHandle` 、 `AbilityHandle` 和 预测Key，<br>
+构造了服务器上的预测Window，根据`AbilityHandle`从`AbilityTargetDataMap`找到对应GA绑定的委托，然后广播这个委托.
+
+```cpp
+void UAbilitySystemComponent::ServerSetReplicatedTargetData_Implementation(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey, 
+const FGameplayAbilityTargetDataHandle& ReplicatedTargetDataHandle, FGameplayTag ApplicationTag, FPredictionKey CurrentPredictionKey)
+{
+    FScopedPredictionWindow ScopedPrediction(this, CurrentPredictionKey);
+    TSharedRef<FAbilityReplicatedDataCache> ReplicatedData = AbilityTargetDataMap.FindOrAdd(FGameplayAbilitySpecHandleAndPredictionKey(AbilityHandle, AbilityOriginalPredictionKey));
+
+    ReplicatedData->TargetSetDelegate.Broadcast(ReplicatedTargetDataHandle, ReplicatedData->ApplicationTag);
+}
+
+/*-----------*/
+
+void ULyraGameplayAbility_RangedWeapon::ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, 
+const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+{
+    OnTargetDataReadyCallbackDelegateHandle = MyAbilityComponent->AbilityTargetDataSetDelegate(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey()).AddUObject(this, &ThisClass::OnTargetDataReadyCallback);
+}
+```
+`ActivateAbility` 时，就绑定了 `AbilityTargetDataMap` 委托，此时 服务器根据 `AbilityHandle` 找到了这个GA.
+
+服务器上的GA 因为刚刚绑定的委托，所以也要执行 `OnTargetDataReadyCallback`:
+```cpp
+void ULyraGameplayAbility_RangedWeapon::OnTargetDataReadyCallback(const FGameplayAbilityTargetDataHandle& InData, FGameplayTag ApplicationTag)
+{
+    FScopedPredictionWindow	ScopedPrediction(MyAbilityComponent);
+
+	// Take ownership of the target data to make sure no callbacks into game code invalidate it out from under us
+	FGameplayAbilityTargetDataHandle LocalTargetDataHandle(MoveTemp(const_cast<FGameplayAbilityTargetDataHandle&>(InData)));
+
+    const bool bShouldNotifyServer = CurrentActorInfo->IsLocallyControlled() && !CurrentActorInfo->IsNetAuthority();
+    if (bShouldNotifyServer)
+	{
+        /* 服务器不会执行这里 */
+		MyAbilityComponent->CallServerSetReplicatedTargetData(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey(), LocalTargetDataHandle, ApplicationTag, MyAbilityComponent->ScopedPredictionKey);
+	}
+
+    /* 服务器和客户端都要执行 */
+    WeaponStateComponent->ClientConfirmTargetData(LocalTargetDataHandle.UniqueId, bIsTargetDataValid, HitReplaces);
+    OnRangedWeaponTargetDataReady(LocalTargetDataHandle);
+    MyAbilityComponent->ConsumeClientReplicatedTargetData(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey());
+}
+```
+`OnRangedWeaponTargetDataReady` 就是蓝图里面的逻辑，如果是服务器的话 要额外的应用GE 造成伤害,<br>
+
+```cpp
+void ULyraGameplayAbility_RangedWeapon::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
+{
+    if (IsEndAbilityValid(Handle, ActorInfo))
+	{
+        // When ability ends, consume target data and remove delegate
+		MyAbilityComponent->AbilityTargetDataSetDelegate(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey()).Remove(OnTargetDataReadyCallbackDelegateHandle);
+
+		MyAbilityComponent->ConsumeClientReplicatedTargetData(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey());
+
+		Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
+    }
+}
+```
+
+在结束技能时，移除激活时绑定的委托，并且清空服务器上的 `TargetData` (`TargetData` 由客户端发送到服务器).
+
+![](Lyra1/img4/GAWeaponFireEnd.png)
+
+0.1秒后 或者 开枪动画播放完 就结束技能，也就是说网络延迟不能高于100毫秒，否则会丢包.
 
 ---
 
