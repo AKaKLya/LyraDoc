@@ -1521,7 +1521,7 @@ struct TIsConst<const T>
 ```
 
 `TIsConst<int>::Value` 匹配第一个版本，值为`false`;
-`TIsConst<const int>::Value` 匹配第二个版本，值为`false`;
+`TIsConst<const int>::Value` 匹配第二个版本，值为`true`;
 
 ---
 
@@ -2962,8 +2962,6 @@ explicit TPimplPtr(FHeapType* Impl) : Ptr(&Impl->Val) {}
 
 至此，`MyPtr` 持有一个指向 `FImpl` 对象的指针，且该对象之前有隐藏的删除器函数指针.
 
-`TPimplPtr`是堆对象，而`TPimplHeapObjectImpl`是在栈上，<br>
-其中的`Val` `Deleter` `Copier`这些内容也是在栈上，
 
 ---
 
